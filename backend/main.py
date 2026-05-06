@@ -35,11 +35,11 @@ async def health():
 
 @app.get("/api/me")
 async def me(user: dict = Depends(get_current_user)):
-    """Returns the authenticated Supabase user."""
+    """Returns the authenticated Clerk user."""
     return {
         "id": user.get("sub"),
-        "email": user.get("email"),
-        "name": user.get("user_metadata", {}).get("name"),
+        "email": user.get("email") or user.get("email_address"),
+        "name": user.get("name") or user.get("full_name"),
     }
 
 

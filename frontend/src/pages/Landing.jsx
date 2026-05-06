@@ -1,5 +1,7 @@
+import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Waveform from '../components/Waveform'
+import { useAuth } from '../context/AuthContext'
 
 const features = [
   {
@@ -43,6 +45,7 @@ const features = [
 
 export default function Landing() {
   const navigate = useNavigate()
+  const { isAuthenticated, user, signOut } = useAuth()
 
   return (
     <div className="min-h-screen bg-white flex flex-col">
@@ -51,18 +54,32 @@ export default function Landing() {
         <div className="max-w-6xl mx-auto px-6 h-14 flex items-center justify-between">
           <Logo />
           <div className="flex items-center gap-3">
-            <button
-              onClick={() => navigate('/login')}
-              className="btn-ghost text-sm"
-            >
-              Log in
-            </button>
-            <button
-              onClick={() => navigate('/signup')}
-              className="btn-primary"
-            >
-              Start for free
-            </button>
+            {isAuthenticated ? (
+              <>
+                <button
+                  onClick={() => navigate('/dashboard')}
+                  className="btn-ghost text-sm"
+                >
+                  Dashboard
+                </button>
+                <UserMenu user={user} onSignOut={async () => { await signOut(); navigate('/') }} />
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={() => navigate('/login')}
+                  className="btn-ghost text-sm"
+                >
+                  Log in
+                </button>
+                <button
+                  onClick={() => navigate('/signup')}
+                  className="btn-primary"
+                >
+                  Start for free
+                </button>
+              </>
+            )}
           </div>
         </div>
       </nav>
@@ -198,6 +215,123 @@ export default function Landing() {
           </div>
         </div>
       </footer>
+    </div>
+  )
+}
+
+function UserMenu({ user, onSignOut }) {
+  const navigate = useNavigate()
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    const onDocClick = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDocClick)
+    return () => document.removeEventListener('mousedown', onDocClick)
+  }, [open])
+
+  const name = user?.user_metadata?.name || user?.email?.split('@')[0] || 'You'
+  const initials = name.split(' ').map(s => s[0]).slice(0, 2).join('').toUpperCase()
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="flex items-center gap-2 pl-1 pr-2 py-1 rounded-full border border-gray-200 hover:border-gray-300 hover:bg-gray-50 transition-colors"
+      >
+        {user?.imageUrl ? (
+          <img src={user.imageUrl} alt={name} className="w-7 h-7 rounded-full object-cover" />
+        ) : (
+          <div className="w-7 h-7 bg-accent-100 text-accent-600 rounded-full flex items-center justify-center text-xs font-semibold">
+            {initials}
+          </div>
+        )}
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="text-gray-400">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+        </svg>
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-12 z-50 card shadow-modal w-60 py-1.5 animate-fade-in">
+          <div className="px-3 py-2.5 border-b border-gray-100">
+            <div className="flex items-center gap-2.5">
+              {user?.imageUrl ? (
+                <img src={user.imageUrl} alt={name} className="w-9 h-9 rounded-full object-cover" />
+              ) : (
+                <div className="w-9 h-9 bg-accent-100 text-accent-600 rounded-full flex items-center justify-center text-sm font-semibold">
+                  {initials}
+                </div>
+              )}
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium text-gray-900 truncate">{name}</div>
+                {user?.email && (
+                  <div className="text-xs text-gray-400 truncate">{user.email}</div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {[
+            {
+              label: 'Dashboard',
+              onClick: () => { setOpen(false); navigate('/dashboard') },
+              icon: (
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
+              ),
+            },
+            {
+              label: 'Edit profile',
+              onClick: () => {
+                setOpen(false)
+                if (typeof window !== 'undefined' && window.Clerk?.openUserProfile) {
+                  window.Clerk.openUserProfile()
+                }
+              },
+              icon: (
+                <path strokeLinecap="round" strokeLinejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+              ),
+            },
+            {
+              label: 'Account settings',
+              onClick: () => {
+                setOpen(false)
+                if (typeof window !== 'undefined' && window.Clerk?.openUserProfile) {
+                  window.Clerk.openUserProfile()
+                }
+              },
+              icon: (
+                <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065zM15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              ),
+            },
+          ].map(({ label, onClick, icon }) => (
+            <button
+              key={label}
+              onClick={onClick}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
+                {icon}
+              </svg>
+              {label}
+            </button>
+          ))}
+
+          <div className="border-t border-gray-100 my-1" />
+
+          <button
+            onClick={() => { setOpen(false); onSignOut() }}
+            className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+            </svg>
+            Sign out
+          </button>
+        </div>
+      )}
     </div>
   )
 }
