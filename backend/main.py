@@ -1,13 +1,24 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
+
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from routers import auth as auth_router, projects
-from auth import get_current_user
+from routers import projects
+from auth import get_current_user, prefetch_jwks
+
+
+@asynccontextmanager
+async def lifespan(app):
+    await prefetch_jwks()
+    yield
 
 app = FastAPI(
     title="Sonicly API",
     description="AI Audio Editor — Backend API",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 # CORS — allow Vercel frontend + local dev
@@ -24,7 +35,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth_router.router, prefix="/api")
 app.include_router(projects.router, prefix="/api")
 
 

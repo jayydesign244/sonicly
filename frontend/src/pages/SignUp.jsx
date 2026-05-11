@@ -15,13 +15,14 @@ const SocialButton = ({ icon, label, onClick, disabled }) => (
 
 export default function SignUp() {
   const navigate = useNavigate()
-  const { signUp, signInWithProvider } = useAuth()
+  const { signUp, signInWithProvider, authReady } = useAuth()
 
   const [showEmail, setShowEmail] = useState(false)
   const [form, setForm] = useState({ name: '', email: '', password: '' })
   const [showPass, setShowPass] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+  const busy = submitting || !authReady
 
   const handleSocial = async (provider) => {
     setError('')
@@ -84,19 +85,19 @@ export default function SignUp() {
           <div className="space-y-2.5">
             <SocialButton
               onClick={() => handleSocial('google')}
-              disabled={submitting}
+              disabled={busy}
               label="Continue with Google"
               icon={<GoogleIcon />}
             />
             <SocialButton
               onClick={() => handleSocial('facebook')}
-              disabled={submitting}
+              disabled={busy}
               label="Continue with Facebook"
               icon={<FacebookIcon />}
             />
             <SocialButton
               onClick={() => handleSocial('apple')}
-              disabled={submitting}
+              disabled={busy}
               label="Continue with Apple"
               icon={<AppleIcon />}
             />
@@ -162,10 +163,10 @@ export default function SignUp() {
 
                   <button
                     onClick={handleEmailSignUp}
-                    disabled={submitting}
+                    disabled={busy}
                     className="btn-primary w-full py-2.5 text-sm disabled:opacity-50"
                   >
-                    {submitting ? 'Creating account...' : 'Create account'}
+                    {!authReady ? 'Loading…' : submitting ? 'Creating account...' : 'Create account'}
                   </button>
                 </div>
               </>
