@@ -4,13 +4,14 @@ import { useAuth } from '../context/AuthContext'
 
 export default function Login() {
   const navigate = useNavigate()
-  const { signIn, signInWithProvider } = useAuth()
+  const { signIn, signInWithProvider, authReady } = useAuth()
 
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [showPass, setShowPass] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+  const busy = submitting || !authReady
 
   const handleSocial = async (provider) => {
     setError('')
@@ -78,7 +79,7 @@ export default function Login() {
               <button
                 key={provider}
                 onClick={() => handleSocial(provider)}
-                disabled={submitting}
+                disabled={busy}
                 className="w-full flex items-center gap-3 px-4 py-2.5 border border-gray-200 rounded-lg text-sm text-gray-700 hover:bg-gray-50 hover:border-gray-300 transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {icon}
@@ -132,10 +133,10 @@ export default function Login() {
 
             <button
               onClick={handleEmailLogin}
-              disabled={submitting}
+              disabled={busy}
               className="btn-primary w-full py-2.5 text-sm mt-1 disabled:opacity-50"
             >
-              {submitting ? 'Logging in...' : 'Log in'}
+              {!authReady ? 'Loading…' : submitting ? 'Logging in...' : 'Log in'}
             </button>
           </div>
 

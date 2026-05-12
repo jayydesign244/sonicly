@@ -5,6 +5,7 @@ import {
   useClerk,
   useSignIn,
   useSignUp,
+  useAuth as useClerkAuth,
 } from '@clerk/clerk-react'
 
 const AuthContext = createContext(null)
@@ -41,6 +42,7 @@ function ClerkAuthBridge({ children }) {
   const { signOut: clerkSignOut } = useClerk()
   const { signIn: clerkSignIn, setActive: setSignInActive, isLoaded: signInLoaded } = useSignIn()
   const { signUp: clerkSignUp, setActive: setSignUpActive, isLoaded: signUpLoaded } = useSignUp()
+  const { getToken } = useClerkAuth()
 
   const signInWithProvider = async (provider) => {
     if (!signInLoaded) return { error: { message: 'Auth still loading…' } }
@@ -99,15 +101,19 @@ function ClerkAuthBridge({ children }) {
     await clerkSignOut()
   }
 
+  const authReady = isLoaded && signInLoaded && signUpLoaded
+
   const value = {
     user: shapeUser(user),
     session: isSignedIn ? { user: shapeUser(user) } : null,
     loading: !isLoaded,
+    authReady,
     isAuthenticated: Boolean(isSignedIn),
     signInWithProvider,
     signUp,
     signIn,
     signOut,
+    getToken,
   }
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
@@ -118,11 +124,13 @@ function DevAuthProvider({ children }) {
     user: { id: 'dev', email: 'dev@local', user_metadata: { name: 'Dev User' } },
     session: { user: { id: 'dev', email: 'dev@local', user_metadata: { name: 'Dev User' } } },
     loading: false,
+    authReady: true,
     isAuthenticated: true,
     signInWithProvider: async () => ({ error: null }),
     signUp: async () => ({ error: null }),
     signIn: async () => ({ error: null }),
     signOut: async () => {},
+    getToken: async () => null,
   }
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }

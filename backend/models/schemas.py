@@ -53,13 +53,12 @@ class ProjectOut(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    role: str
-    text: str
+    role: str  # "user" or "assistant"
+    content: str
 
 
 class ChatRequest(BaseModel):
-    project_id: int
-    message: str
+    messages: List[ChatMessage]
 
 
 class ChatResponse(BaseModel):

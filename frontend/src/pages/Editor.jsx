@@ -1,14 +1,10 @@
 import { useState, useRef, useEffect } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Waveform from '../components/Waveform'
+import { useAuth } from '../context/AuthContext'
+import { streamChat } from '../lib/api'
 
-/* ─── Sample Data ─────────────────────────────────────────────── */
-const INITIAL_MESSAGES = [
-  { role: 'user', text: 'Remove the background noise' },
-  { role: 'ai', text: 'Done. Removed the background noise throughout your recording. Your voice sounds much clearer now. Want me to also fix the room reverb?' },
-  { role: 'user', text: 'Yes and make my voice a bit warmer' },
-  { role: 'ai', text: 'Done! Reduced the reverb and added some warmth to your voice. Quality improved from 42 → 87. Anything else?' },
-]
+const INITIAL_MESSAGES = []
 
 const TRANSCRIPT_LINES = [
   { time: '00:00', text: 'Welcome back to the show. Today we are talking about, um, the future of AI in audio editing.' },
@@ -297,7 +293,8 @@ function PauseIcon() {
 export default function Editor() {
   const navigate = useNavigate()
   const location = useLocation()
-  const project = location.state?.project || { name: 'podcast_episode_12', seed: 42 }
+  const { getToken } = useAuth()
+  const project = location.state?.project || { id: 1, name: 'podcast_episode_12', seed: 42 }
 
   const [showExport, setShowExport] = useState(false)
   const [showCompare, setShowCompare] = useState(false)
@@ -309,33 +306,53 @@ export default function Editor() {
   const [isEditingName, setIsEditingName] = useState(false)
   const [projectName, setProjectName] = useState(project.name || 'podcast_episode_12')
   const [selectedWord, setSelectedWord] = useState(null)
+  const [isStreaming, setIsStreaming] = useState(false)
   const chatEndRef = useRef(null)
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  const sendToAI = async (userText) => {
+    const history = [...messages, { role: 'user', text: userText }]
+    setMessages([...history, { role: 'ai', text: '' }])
+    setIsStreaming(true)
+    try {
+      await streamChat({
+        projectId: project.id || 1,
+        messages: history,
+        getToken,
+        onDelta: (delta) => {
+          setMessages(prev => {
+            const next = [...prev]
+            const last = next[next.length - 1]
+            next[next.length - 1] = { ...last, text: (last.text || '') + delta }
+            return next
+          })
+        },
+      })
+    } catch (err) {
+      setMessages(prev => {
+        const next = [...prev]
+        next[next.length - 1] = { role: 'ai', text: `⚠️ ${err.message}` }
+        return next
+      })
+    } finally {
+      setIsStreaming(false)
+    }
+  }
+
   const handleSend = () => {
     const text = inputText.trim()
-    if (!text) return
+    if (!text || isStreaming) return
     setInputText('')
-    const newMessages = [...messages, { role: 'user', text }]
-    setMessages(newMessages)
-    setTimeout(() => {
-      setMessages(prev => [
-        ...prev,
-        { role: 'ai', text: "Done! I've applied that change to your audio. Quality score is holding at 87. Anything else you'd like to adjust?" },
-      ])
-    }, 900)
+    sendToAI(text)
   }
 
   const handleFixAll = () => {
+    if (isStreaming) return
     setShowDiagnosis(false)
-    setMessages(prev => [
-      ...prev,
-      { role: 'user', text: 'Fix all three issues' },
-      { role: 'ai', text: "Done! I've removed the background noise, reduced the room reverb, and cut 34 filler words. Quality jumped from 42 → 87. Your recording sounds great now." },
-    ])
+    sendToAI('Fix all three issues: background noise, room reverb, and filler words.')
   }
 
   const isFillerWord = (word) => FILLER_WORDS.some(fw => word.toLowerCase().includes(fw.toLowerCase().replace(',', '')))
@@ -500,15 +517,16 @@ export default function Editor() {
             <div className="flex items-center gap-2 border border-gray-200 rounded-lg px-3 py-2 focus-within:ring-2 focus-within:ring-accent-500 focus-within:border-transparent transition-all">
               <input
                 type="text"
-                placeholder="Describe what you want..."
+                placeholder={isStreaming ? 'AI is responding…' : 'Describe what you want...'}
                 value={inputText}
                 onChange={e => setInputText(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && handleSend()}
-                className="flex-1 text-sm text-gray-900 placeholder-gray-400 bg-transparent focus:outline-none"
+                disabled={isStreaming}
+                className="flex-1 text-sm text-gray-900 placeholder-gray-400 bg-transparent focus:outline-none disabled:opacity-60"
               />
               <button
                 onClick={handleSend}
-                disabled={!inputText.trim()}
+                disabled={!inputText.trim() || isStreaming}
                 className="w-7 h-7 bg-accent-500 hover:bg-accent-600 disabled:bg-gray-200 text-white rounded-md flex items-center justify-center transition-colors flex-shrink-0"
               >
                 <svg width="12" height="12" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>

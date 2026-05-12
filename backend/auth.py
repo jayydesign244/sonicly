@@ -1,6 +1,7 @@
 """Clerk JWT verification for FastAPI."""
 import os
-from functools import lru_cache
+import asyncio
+from typing import Optional
 
 import httpx
 from fastapi import Depends, HTTPException, status
@@ -15,20 +16,39 @@ CLERK_JWKS_URL = (
 
 security = HTTPBearer(auto_error=False)
 
-
-@lru_cache(maxsize=1)
-def _jwks() -> dict:
-    resp = httpx.get(CLERK_JWKS_URL, timeout=5.0)
-    resp.raise_for_status()
-    return resp.json()
+_jwks_cache: Optional[dict] = None
+_jwks_lock = asyncio.Lock()
 
 
-def _key_for_kid(kid: str):
-    keys = _jwks().get("keys", [])
+async def _jwks() -> dict:
+    global _jwks_cache
+    if _jwks_cache is not None:
+        return _jwks_cache
+    async with _jwks_lock:
+        if _jwks_cache is not None:
+            return _jwks_cache
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(CLERK_JWKS_URL)
+            resp.raise_for_status()
+            _jwks_cache = resp.json()
+    return _jwks_cache
+
+
+async def prefetch_jwks() -> None:
+    """Call from app startup so the first user request doesn't pay the latency."""
+    if CLERK_JWKS_URL:
+        try:
+            await _jwks()
+        except Exception as exc:
+            print(f"[auth] JWKS prefetch failed (will retry on first request): {exc}")
+
+
+async def _key_for_kid(kid: str):
+    keys = (await _jwks()).get("keys", [])
     return next((k for k in keys if k.get("kid") == kid), None)
 
 
-def get_current_user(
+async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> dict:
     """Verifies a Clerk-issued JWT and returns the decoded payload."""
@@ -45,7 +65,7 @@ def get_current_user(
     token = credentials.credentials
     try:
         header = jwt.get_unverified_header(token)
-        key = _key_for_kid(header.get("kid"))
+        key = await _key_for_kid(header.get("kid"))
         if key is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
