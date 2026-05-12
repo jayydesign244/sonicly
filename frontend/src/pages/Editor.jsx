@@ -3,6 +3,7 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import Waveform from '../components/Waveform'
 import { useAuth } from '../context/AuthContext'
 import { streamChat } from '../lib/api'
+import { useAudioPlayer, formatTime } from '../hooks/useAudioPlayer'
 
 const INITIAL_MESSAGES = []
 
@@ -302,12 +303,24 @@ export default function Editor() {
   const [messages, setMessages] = useState(INITIAL_MESSAGES)
   const [inputText, setInputText] = useState('')
   const [activeVersion, setActiveVersion] = useState('warmth')
-  const [isPlaying, setIsPlaying] = useState(false)
   const [isEditingName, setIsEditingName] = useState(false)
   const [projectName, setProjectName] = useState(project.name || 'podcast_episode_12')
   const [selectedWord, setSelectedWord] = useState(null)
   const [isStreaming, setIsStreaming] = useState(false)
+  const [volume, setVolumeState] = useState(80)
+  const [rate, setRateState] = useState('1')
   const chatEndRef = useRef(null)
+
+  const audioUrl = project.audio_url || null
+  const player = useAudioPlayer({ url: audioUrl })
+
+  useEffect(() => {
+    if (player.isReady) {
+      player.setVolume(volume / 100)
+      player.setRate(parseFloat(rate))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [player.isReady])
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -542,14 +555,26 @@ export default function Editor() {
           {/* TOP HALF — Waveform */}
           <div className="flex-shrink-0 border-b border-gray-100 p-5">
             {/* Waveform */}
-            <div className="relative mb-4">
-              <Waveform
-                seed={project.seed || 42}
-                showGhost
-                ghostColor="#e5e7eb"
-                height={60}
-                bars={100}
-              />
+            <div className="relative mb-4 min-h-[60px]">
+              {audioUrl ? (
+                <>
+                  <div ref={player.containerRef} className="w-full" />
+                  {!player.isReady && !player.error && (
+                    <div className="absolute inset-0 flex items-center justify-center text-xs text-gray-400">
+                      Loading audio…
+                    </div>
+                  )}
+                  {player.error && (
+                    <div className="absolute inset-0 flex items-center justify-center text-xs text-red-500">
+                      {player.error}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="h-[60px] flex items-center justify-center border border-dashed border-gray-200 rounded-lg text-xs text-gray-400">
+                  No audio uploaded for this project
+                </div>
+              )}
             </div>
 
             {/* Summary chips */}
@@ -564,38 +589,69 @@ export default function Editor() {
             {/* Playback controls */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-1">
-                <button className="w-8 h-8 flex items-center justify-center text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-md transition-colors">
+                <button
+                  onClick={() => player.skip(-10)}
+                  disabled={!player.isReady}
+                  className="w-8 h-8 flex items-center justify-center text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-md transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+                  title="Back 10s"
+                >
                   <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M12.066 11.2a1 1 0 000 1.6l5.334 4A1 1 0 0019 16V8a1 1 0 00-1.6-.8l-5.334 4z" />
                     <path strokeLinecap="round" strokeLinejoin="round" d="M4.066 11.2a1 1 0 000 1.6l5.334 4A1 1 0 0011 16V8a1 1 0 00-1.6-.8l-5.334 4z" />
                   </svg>
                 </button>
                 <button
-                  onClick={() => setIsPlaying(v => !v)}
-                  className="w-9 h-9 bg-accent-500 hover:bg-accent-600 text-white rounded-full flex items-center justify-center transition-colors"
+                  onClick={player.toggle}
+                  disabled={!player.isReady}
+                  className="w-9 h-9 bg-accent-500 hover:bg-accent-600 text-white rounded-full flex items-center justify-center transition-colors disabled:opacity-40 disabled:hover:bg-accent-500"
                 >
-                  {isPlaying ? <PauseIcon /> : <PlayIcon />}
+                  {player.isPlaying ? <PauseIcon /> : <PlayIcon />}
                 </button>
-                <button className="w-8 h-8 flex items-center justify-center text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-md transition-colors">
+                <button
+                  onClick={() => player.skip(10)}
+                  disabled={!player.isReady}
+                  className="w-8 h-8 flex items-center justify-center text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-md transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+                  title="Forward 10s"
+                >
                   <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M11.933 12.8a1 1 0 000-1.6L6.6 7.2A1 1 0 005 8v8a1 1 0 001.6.8l5.333-4z" />
                     <path strokeLinecap="round" strokeLinejoin="round" d="M19.933 12.8a1 1 0 000-1.6l-5.333-4A1 1 0 0013 8v8a1 1 0 001.6.8l5.333-4z" />
                   </svg>
                 </button>
               </div>
-              <span className="text-xs text-gray-400 font-mono">00:42 / 03:42</span>
+              <span className="text-xs text-gray-400 font-mono">
+                {formatTime(player.currentTime)} / {formatTime(player.duration)}
+              </span>
               <div className="flex items-center gap-3">
                 <div className="flex items-center gap-1.5">
                   <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8} className="text-gray-400">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M15.536 8.464a5 5 0 010 7.072M12 6a7 7 0 010 12M9.464 8.464a5 5 0 000 7.072" />
                   </svg>
-                  <input type="range" className="w-16 accent-accent-500" min="0" max="100" defaultValue="80" />
+                  <input
+                    type="range"
+                    className="w-16 accent-accent-500"
+                    min="0"
+                    max="100"
+                    value={volume}
+                    onChange={e => {
+                      const v = Number(e.target.value)
+                      setVolumeState(v)
+                      player.setVolume(v / 100)
+                    }}
+                  />
                 </div>
-                <select className="text-xs text-gray-500 border border-gray-200 rounded-md px-1.5 py-0.5 focus:outline-none">
-                  <option>1×</option>
-                  <option>1.25×</option>
-                  <option>1.5×</option>
-                  <option>2×</option>
+                <select
+                  value={rate}
+                  onChange={e => {
+                    setRateState(e.target.value)
+                    player.setRate(parseFloat(e.target.value))
+                  }}
+                  className="text-xs text-gray-500 border border-gray-200 rounded-md px-1.5 py-0.5 focus:outline-none"
+                >
+                  <option value="1">1×</option>
+                  <option value="1.25">1.25×</option>
+                  <option value="1.5">1.5×</option>
+                  <option value="2">2×</option>
                 </select>
               </div>
             </div>

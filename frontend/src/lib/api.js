@@ -1,5 +1,54 @@
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api'
 
+async function authHeaders(getToken) {
+  const token = getToken ? await getToken() : null
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
+async function handleJson(res) {
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '')
+    throw new Error(`${res.status} ${res.statusText}: ${detail}`)
+  }
+  if (res.status === 204) return null
+  return res.json()
+}
+
+export async function listProjects({ getToken } = {}) {
+  const res = await fetch(`${API_URL}/projects/`, {
+    headers: { ...(await authHeaders(getToken)) },
+  })
+  return handleJson(res)
+}
+
+export async function createProject({ name, duration, getToken } = {}) {
+  const res = await fetch(`${API_URL}/projects/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(await authHeaders(getToken)) },
+    body: JSON.stringify({ name, ...(duration ? { duration } : {}) }),
+  })
+  return handleJson(res)
+}
+
+export async function deleteProject({ id, getToken } = {}) {
+  const res = await fetch(`${API_URL}/projects/${id}`, {
+    method: 'DELETE',
+    headers: { ...(await authHeaders(getToken)) },
+  })
+  return handleJson(res)
+}
+
+export async function uploadAudio({ id, file, getToken } = {}) {
+  const form = new FormData()
+  form.append('file', file)
+  const res = await fetch(`${API_URL}/projects/${id}/upload`, {
+    method: 'POST',
+    headers: { ...(await authHeaders(getToken)) },
+    body: form,
+  })
+  return handleJson(res)
+}
+
 export async function streamChat({ projectId, messages, getToken, onDelta, signal }) {
   const token = await getToken()
   const res = await fetch(`${API_URL}/projects/${projectId}/chat`, {
