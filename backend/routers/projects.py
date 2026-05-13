@@ -26,7 +26,7 @@ from models.db import Project, AudioVersion
 from auth import get_current_user
 from database import get_db
 from storage import upload_audio as storage_upload, is_configured as storage_configured
-from services import audio_editor, fillers as fillers_service
+from services import audio_editor, fillers as fillers_service, voice as voice_service
 from typing import List, Optional, Tuple
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -409,20 +409,92 @@ def _resolve_word_refs(
     return out
 
 
-def _transcript_minus_words(
-    transcript: dict, removed: List[Tuple[int, int]]
+def _apply_edits_to_transcript(
+    transcript: dict,
+    deletes: List[Tuple[int, int]],
+    replaces: List[Tuple[int, int, str]],
 ) -> dict:
-    """Return a deep copy of the transcript with the given words stripped."""
-    drop = {(s, w) for s, w in removed}
+    """Return a deep copy of the transcript with deletes stripped and
+    replaces' word text overwritten. Word timestamps are kept (the
+    audio splice keeps the timeline aligned at word boundaries)."""
+    drop = {(s, w) for s, w in deletes}
+    rmap = {(s, w): new for s, w, new in replaces}
     out = copy.deepcopy(transcript)
     for si, seg in enumerate(out.get("segments") or []):
-        kept = [w for wi, w in enumerate(seg.get("words") or []) if (si, wi) not in drop]
+        kept = []
+        for wi, w in enumerate(seg.get("words") or []):
+            if (si, wi) in drop:
+                continue
+            if (si, wi) in rmap:
+                w = {**w, "text": rmap[(si, wi)]}
+            kept.append(w)
         seg["words"] = kept
-        seg["text"] = " ".join(w.get("text", "").strip() for w in kept).strip()
-    # Drop empty segments — common after a full-line delete.
+        seg["text"] = " ".join((w.get("text", "") or "").strip() for w in kept).strip()
     out["segments"] = [s for s in out["segments"] if s.get("words")]
     out["text"] = " ".join(s.get("text", "") for s in out["segments"]).strip()
     return out
+
+
+def _word_range(transcript: dict, si: int, wi: int, pad: float = 0.04) -> Optional[Tuple[float, float]]:
+    segs = (transcript or {}).get("segments") or []
+    if si < 0 or si >= len(segs):
+        return None
+    words = segs[si].get("words") or []
+    if wi < 0 or wi >= len(words):
+        return None
+    w = words[wi]
+    try:
+        return (max(0.0, float(w["start"]) - pad), float(w["end"]) + pad)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+async def _ensure_voice_clone(project: Project, source_audio: bytes) -> str:
+    """Return the project's voice_id, cloning from the source audio if needed."""
+    if project.voice_id:
+        return project.voice_id
+    voice_id = await voice_service.clone_voice(
+        source_audio, name=f"sonicly-{project.id}-{project.name[:32]}"
+    )
+    project.voice_id = voice_id
+    project.voice_provider = "elevenlabs"
+    return voice_id
+
+
+@router.post("/{project_id}/voice/clone", response_model=ProjectOut)
+async def clone_project_voice(
+    project_id: int,
+    user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Clone the user's voice from the project's source audio. Idempotent —
+    returns the existing voice_id when one is already attached."""
+    project = await _get_owned_project(db, project_id, user)
+    if project.voice_id:
+        return ProjectOut.model_validate(project)
+    if not project.audio_url:
+        raise HTTPException(status_code=400, detail="Project has no audio to clone")
+    if not voice_service.is_configured():
+        raise HTTPException(
+            status_code=503, detail="ELEVENLABS_API_KEY not configured"
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.get(project.audio_url)
+            resp.raise_for_status()
+            audio_bytes = resp.content
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Fetch source audio: {exc}")
+
+    try:
+        await _ensure_voice_clone(project, audio_bytes)
+    except voice_service.VoiceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    await db.commit()
+    await db.refresh(project)
+    return ProjectOut.model_validate(project)
 
 
 @router.post("/{project_id}/edits/apply", response_model=AudioVersionOut)
@@ -438,14 +510,11 @@ async def apply_edits(
     if not project.transcript:
         raise HTTPException(status_code=400, detail="Project has no transcript")
     if not audio_editor.ffmpeg_available():
-        raise HTTPException(
-            status_code=503,
-            detail="ffmpeg not installed on the server",
-        )
+        raise HTTPException(status_code=503, detail="ffmpeg not installed on the server")
     if not storage_configured():
         raise HTTPException(status_code=503, detail="Storage not configured")
 
-    # Pick the source audio (parent version's URL if provided, else current).
+    # Pick the source (parent version's URL if provided, else current).
     source_url = project.audio_url
     source_transcript = project.transcript
     if payload.parent_version_id is not None:
@@ -460,20 +529,33 @@ async def apply_edits(
             source_url = parent.audio_url
             source_transcript = parent.transcript or source_transcript
 
-    # Collect deletion word refs from all delete-typed edits.
+    # Collect refs.
     delete_refs: List[Tuple[int, int]] = []
+    replace_refs: List[Tuple[int, int, str]] = []
     for edit in payload.edits:
-        if edit.get("type") == "delete":
-            delete_refs.extend(_resolve_word_refs(transcript=source_transcript, refs=edit.get("words", [])))
-        # "replace" edits are no-ops here until the voice service lands.
+        t = edit.get("type")
+        if t == "delete":
+            delete_refs.extend(
+                _resolve_word_refs(transcript=source_transcript, refs=edit.get("words", []))
+            )
+        elif t == "replace":
+            w = edit.get("word", {})
+            new_text = (edit.get("new_text") or "").strip()
+            if not new_text:
+                continue
+            try:
+                replace_refs.append((int(w["segment_idx"]), int(w["word_idx"]), new_text))
+            except (KeyError, TypeError, ValueError):
+                continue
 
-    if not delete_refs:
+    if not delete_refs and not replace_refs:
+        raise HTTPException(status_code=400, detail="No edits to apply")
+
+    if replace_refs and not voice_service.is_configured():
         raise HTTPException(
-            status_code=400,
-            detail="No supported edits in this request (only delete is implemented)",
+            status_code=503,
+            detail="ELEVENLABS_API_KEY not configured (required for word replacement)",
         )
-
-    ranges = fillers_service.words_to_ranges(source_transcript, delete_refs)
 
     with tempfile.TemporaryDirectory() as tmp:
         src_path = os.path.join(tmp, "in.mp3")
@@ -483,21 +565,68 @@ async def apply_edits(
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.get(source_url)
                 resp.raise_for_status()
-                with open(src_path, "wb") as f:
-                    f.write(resp.content)
+                src_bytes = resp.content
+            with open(src_path, "wb") as f:
+                f.write(src_bytes)
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"Fetch source audio: {exc}")
 
         duration = await audio_editor.probe_duration(src_path)
-        keeps = audio_editor.keep_ranges(ranges, duration)
-        if not keeps:
-            raise HTTPException(
-                status_code=400,
-                detail="Edits would remove the entire audio",
-            )
+        if duration <= 0:
+            raise HTTPException(status_code=500, detail="Could not probe audio duration")
+
+        # If we have replaces, ensure a voice clone is attached.
+        if replace_refs:
+            try:
+                await _ensure_voice_clone(project, src_bytes)
+            except voice_service.VoiceError as exc:
+                raise HTTPException(status_code=502, detail=f"Voice clone: {exc}")
+
+            # Generate one mp3 per replace, dump into the temp dir.
+            for i, (si, wi, new_text) in enumerate(replace_refs):
+                try:
+                    audio = await voice_service.synthesize(project.voice_id, new_text)
+                except voice_service.VoiceError as exc:
+                    raise HTTPException(status_code=502, detail=f"TTS: {exc}")
+                gen_path = os.path.join(tmp, f"gen_{i}.mp3")
+                with open(gen_path, "wb") as f:
+                    f.write(audio)
+                replace_refs[i] = (si, wi, new_text, gen_path)  # type: ignore
+
+        # Build chronological op list.
+        events: List[dict] = []  # each: {start, end, type: 'delete'|'replace', path?}
+        for si, wi in delete_refs:
+            r = _word_range(source_transcript, si, wi)
+            if r:
+                events.append({"start": r[0], "end": r[1], "type": "delete"})
+        for ref in replace_refs:
+            if len(ref) < 4:
+                continue  # safety
+            si, wi, new_text, gen_path = ref  # type: ignore
+            r = _word_range(source_transcript, si, wi, pad=0.0)
+            if r:
+                events.append({
+                    "start": r[0], "end": r[1], "type": "replace", "path": gen_path
+                })
+        events.sort(key=lambda e: e["start"])
+
+        # Convert events → ops (keep segments + replace inserts; deletes are gaps).
+        ops: List[dict] = []
+        cursor = 0.0
+        for ev in events:
+            if ev["start"] > cursor + 0.001:
+                ops.append({"type": "keep", "start": cursor, "end": min(ev["start"], duration)})
+            if ev["type"] == "replace":
+                ops.append({"type": "insert", "path": ev["path"]})
+            cursor = max(cursor, ev["end"])
+        if cursor < duration - 0.001:
+            ops.append({"type": "keep", "start": cursor, "end": duration})
+
+        if not ops:
+            raise HTTPException(status_code=400, detail="Edits would remove the entire audio")
 
         try:
-            await audio_editor.render_with_keeps(src_path, keeps, out_path)
+            await audio_editor.render_with_ops(src_path, ops, out_path)
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
@@ -516,13 +645,24 @@ async def apply_edits(
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Upload edited audio: {exc}")
 
-    new_transcript = _transcript_minus_words(source_transcript, delete_refs)
+    new_transcript = _apply_edits_to_transcript(
+        source_transcript,
+        delete_refs,
+        [(si, wi, new_text) for ref in replace_refs for si, wi, new_text, *_ in [ref]],
+    )
     new_transcript["duration"] = new_duration
+
+    parts = []
+    if delete_refs:
+        parts.append(f"Removed {len(delete_refs)}")
+    if replace_refs:
+        parts.append(f"Replaced {len(replace_refs)}")
+    default_label = " · ".join(parts) + " word" + ("s" if (len(delete_refs) + len(replace_refs)) != 1 else "")
 
     version = AudioVersion(
         project_id=project_id,
         parent_id=payload.parent_version_id,
-        label=payload.label or f"Removed {len(delete_refs)} word{'s' if len(delete_refs) != 1 else ''}",
+        label=payload.label or default_label,
         audio_url=public_url,
         transcript=new_transcript,
         duration=new_duration,

@@ -21,6 +21,8 @@ class Project(Base):
     audio_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     transcript: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     active_version_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    voice_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    voice_provider: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False
     )

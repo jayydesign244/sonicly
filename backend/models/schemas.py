@@ -49,6 +49,8 @@ class ProjectOut(BaseModel):
     audio_url: Optional[str] = None
     transcript: Optional[dict] = None
     active_version_id: Optional[int] = None
+    voice_id: Optional[str] = None
+    voice_provider: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

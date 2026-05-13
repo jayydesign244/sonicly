@@ -10,6 +10,7 @@ import {
   applyEdits,
   listVersions,
   activateVersion,
+  cloneVoice,
 } from '../lib/api'
 import { useAudioPlayer, formatTime } from '../hooks/useAudioPlayer'
 import { usePendingEdits } from '../hooks/usePendingEdits'
@@ -315,6 +316,9 @@ export default function Editor() {
   const [activeVersionId, setActiveVersionId] = useState(project.active_version_id || null)
   const [applyingEdits, setApplyingEdits] = useState(false)
   const [editError, setEditError] = useState(null)
+  const [voiceId, setVoiceId] = useState(project.voice_id || null)
+  const [voiceCloning, setVoiceCloning] = useState(false)
+  const [inlineEdit, setInlineEdit] = useState(null) // { si, wi, text }
   const pending = usePendingEdits()
   const chatEndRef = useRef(null)
   const activeWordRef = useRef(null)
@@ -340,6 +344,7 @@ export default function Editor() {
         if (cancelled) return
         setAudioUrl(fresh.audio_url || null)
         setActiveVersionId(fresh.active_version_id || null)
+        setVoiceId(fresh.voice_id || null)
         if (fresh.transcript) {
           setTranscript(fresh.transcript)
           setTranscriptState('ready')
@@ -445,14 +450,49 @@ export default function Editor() {
       setActiveVersionId(version.id)
       if (version.audio_url) setAudioUrl(version.audio_url)
       if (version.transcript) setTranscript(version.transcript)
-      const fresh = await listVersions({ id: project.id, getToken })
-      setVersions(fresh || [])
+      const [freshVersions, freshProject] = await Promise.all([
+        listVersions({ id: project.id, getToken }),
+        getProject({ id: project.id, getToken }),
+      ])
+      setVersions(freshVersions || [])
+      if (freshProject?.voice_id) setVoiceId(freshProject.voice_id)
     } catch (err) {
       setEditError(err.message)
     } finally {
       setApplyingEdits(false)
     }
   }
+
+  const handleCloneVoice = async () => {
+    if (!project.id || voiceCloning) return
+    setVoiceCloning(true)
+    setEditError(null)
+    try {
+      const updated = await cloneVoice({ id: project.id, getToken })
+      setVoiceId(updated.voice_id || null)
+    } catch (err) {
+      setEditError(err.message)
+    } finally {
+      setVoiceCloning(false)
+    }
+  }
+
+  const beginInlineEdit = (si, wi, currentText) => {
+    setSelectedWord(null)
+    setInlineEdit({ si, wi, text: (currentText || '').trim() })
+  }
+
+  const commitInlineEdit = () => {
+    if (!inlineEdit) return
+    const trimmed = inlineEdit.text.trim()
+    const original = transcript?.segments?.[inlineEdit.si]?.words?.[inlineEdit.wi]?.text?.trim() || ''
+    if (trimmed && trimmed !== original) {
+      pending.queueReplace(inlineEdit.si, inlineEdit.wi, trimmed)
+    }
+    setInlineEdit(null)
+  }
+
+  const cancelInlineEdit = () => setInlineEdit(null)
 
   const handleActivateVersion = async (versionId) => {
     if (!project.id || versionId === activeVersionId) return
@@ -875,11 +915,32 @@ export default function Editor() {
               )}
 
               <span className="ml-auto flex items-center gap-2">
+                {transcriptState === 'ready' && (
+                  voiceId ? (
+                    <span
+                      className="text-[11px] px-1.5 py-0.5 rounded-full bg-violet-50 text-violet-700 border border-violet-200"
+                      title="Voice clone ready — edited words will be regenerated in this voice"
+                    >
+                      🎙 Voice ready
+                    </span>
+                  ) : (
+                    <button
+                      onClick={handleCloneVoice}
+                      disabled={voiceCloning || !audioUrl}
+                      className="text-[11px] px-1.5 py-0.5 rounded-full bg-gray-50 border border-gray-200 text-gray-600 hover:bg-violet-50 hover:text-violet-700 hover:border-violet-200 disabled:opacity-40"
+                      title="Clone your voice from this audio so edited words can be regenerated"
+                    >
+                      {voiceCloning ? '🎙 Cloning…' : '🎙 Clone voice'}
+                    </button>
+                  )
+                )}
                 {editError && <span className="text-xs text-red-500 max-w-[200px] truncate" title={editError}>{editError}</span>}
                 {pending.count > 0 && (
                   <>
                     <span className="text-xs text-gray-500">
-                      {pending.deleteCount} pending delete{pending.deleteCount === 1 ? '' : 's'}
+                      {pending.deleteCount > 0 && `${pending.deleteCount} delete${pending.deleteCount === 1 ? '' : 's'}`}
+                      {pending.deleteCount > 0 && pending.replaceCount > 0 && ' · '}
+                      {pending.replaceCount > 0 && `${pending.replaceCount} replace${pending.replaceCount === 1 ? '' : 's'}`}
                     </span>
                     <button
                       onClick={pending.undo}
@@ -900,13 +961,13 @@ export default function Editor() {
                       disabled={applyingEdits}
                       className="btn-primary text-xs py-1 px-2.5 disabled:opacity-60"
                     >
-                      {applyingEdits ? 'Applying…' : 'Confirm'}
+                      {applyingEdits ? (pending.replaceCount > 0 ? 'Regenerating…' : 'Applying…') : 'Confirm'}
                     </button>
                   </>
                 )}
                 {pending.count === 0 && (
                   <span className="text-xs text-gray-400 hidden md:inline">
-                    Click a word to delete · Click again to undo
+                    Click delete · Double-click edit · Shift+click jump
                   </span>
                 )}
               </span>
@@ -948,11 +1009,39 @@ export default function Editor() {
                       const key = `${i}-${wi}`
                       const filler = isFillerWord(i, wi)
                       const deleted = pending.isDeleted(i, wi)
+                      const replacedTo = pending.replacedText(i, wi)
+                      const replaced = replacedTo !== undefined
                       const active = activeWordKey === key
                       const selected = selectedWord === key
+                      const editing = inlineEdit && inlineEdit.si === i && inlineEdit.wi === wi
+                      const original = (w.text || '').trim()
+
+                      if (editing) {
+                        return (
+                          <span key={wi} className="relative inline-block">
+                            <input
+                              autoFocus
+                              value={inlineEdit.text}
+                              onChange={e => setInlineEdit(s => ({ ...s, text: e.target.value }))}
+                              onBlur={commitInlineEdit}
+                              onKeyDown={e => {
+                                if (e.key === 'Enter') { e.preventDefault(); commitInlineEdit() }
+                                if (e.key === 'Escape') { e.preventDefault(); cancelInlineEdit() }
+                              }}
+                              className="px-1 py-0 -my-0.5 text-sm bg-violet-50 border border-violet-300 rounded outline-none focus:ring-1 focus:ring-violet-400 min-w-[60px]"
+                              size={Math.max(inlineEdit.text.length, 4)}
+                            />{' '}
+                          </span>
+                        )
+                      }
+
                       const onWordClick = (e) => {
                         if (e.shiftKey) {
                           player.seek(w.start, { play: true })
+                          return
+                        }
+                        if (e.altKey || e.metaKey) {
+                          beginInlineEdit(i, wi, original)
                           return
                         }
                         pending.toggleDelete(i, wi)
@@ -962,14 +1051,21 @@ export default function Editor() {
                           key={wi}
                           ref={active ? activeWordRef : null}
                           onClick={onWordClick}
+                          onDoubleClick={(e) => { e.preventDefault(); beginInlineEdit(i, wi, original) }}
                           onContextMenu={(e) => {
                             e.preventDefault()
                             setSelectedWord(selected ? null : key)
                           }}
-                          title={deleted ? 'Click to undo delete' : 'Click to delete · Shift+click to jump · Right-click for more'}
+                          title={
+                            deleted ? 'Click to undo delete'
+                            : replaced ? `Will be replaced with "${replacedTo}" · Click to undo`
+                            : 'Click to delete · Double-click to edit · Shift+click to jump · Right-click for more'
+                          }
                           className={`cursor-pointer relative inline-block transition-colors ${
                             deleted
                               ? 'text-red-400 line-through decoration-red-300'
+                              : replaced
+                              ? 'text-violet-700 bg-violet-50 rounded px-0.5 underline decoration-violet-400 decoration-2 underline-offset-2'
                               : active
                               ? 'bg-accent-100 text-accent-700 rounded'
                               : filler
@@ -977,14 +1073,21 @@ export default function Editor() {
                               : 'hover:text-accent-600 hover:underline hover:underline-offset-2 hover:decoration-accent-300'
                           } ${selected ? 'ring-1 ring-accent-300 rounded' : ''}`}
                         >
-                          {w.text.trim()}{' '}
+                          {replaced ? replacedTo : original}{' '}
                           {selected && (
                             <span className="absolute -top-8 left-0 z-10 flex items-center gap-1 bg-gray-900 text-white text-xs rounded-lg px-2 py-1 whitespace-nowrap shadow-lg animate-fade-in">
                               <button
                                 onClick={(e) => { e.stopPropagation(); player.seek(w.start, { play: true }); setSelectedWord(null) }}
                                 className="hover:text-accent-300 transition-colors"
                               >
-                                ▶ Jump to {fmtMMSS(w.start)}
+                                ▶ Jump
+                              </button>
+                              <span className="text-gray-600">·</span>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); beginInlineEdit(i, wi, original) }}
+                                className="hover:text-violet-300 transition-colors"
+                              >
+                                ✏️ Edit
                               </button>
                               <span className="text-gray-600">·</span>
                               <button

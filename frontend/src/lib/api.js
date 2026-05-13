@@ -64,6 +64,14 @@ export async function transcribeAudio({ id, getToken } = {}) {
   return handleJson(res)
 }
 
+export async function cloneVoice({ id, getToken } = {}) {
+  const res = await fetch(`${API_URL}/projects/${id}/voice/clone`, {
+    method: 'POST',
+    headers: { ...(await authHeaders(getToken)) },
+  })
+  return handleJson(res)
+}
+
 export async function detectFillers({ id, getToken } = {}) {
   const res = await fetch(`${API_URL}/projects/${id}/fillers`, {
     method: 'POST',
