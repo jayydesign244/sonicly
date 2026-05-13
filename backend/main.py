@@ -5,11 +5,13 @@ load_dotenv()
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from routers import projects
 from auth import get_current_user, prefetch_jwks
 from database import engine, IS_SQLITE
 from models.db import Base
+from storage import LOCAL_UPLOAD_DIR, LOCAL_PUBLIC_PREFIX, supabase_configured
 
 
 @asynccontextmanager
@@ -51,6 +53,16 @@ app.add_middleware(
 )
 
 app.include_router(projects.router, prefix="/api")
+
+# Local audio storage fallback — mounted only when Supabase isn't configured.
+if not supabase_configured():
+    LOCAL_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount(
+        LOCAL_PUBLIC_PREFIX,
+        StaticFiles(directory=str(LOCAL_UPLOAD_DIR)),
+        name="local-uploads",
+    )
+    print(f"[storage] Supabase not configured — serving uploads from {LOCAL_UPLOAD_DIR} at {LOCAL_PUBLIC_PREFIX}")
 
 
 @app.get("/api/health")
