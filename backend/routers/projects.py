@@ -449,16 +449,29 @@ def _word_range(transcript: dict, si: int, wi: int, pad: float = 0.04) -> Option
         return None
 
 
-async def _ensure_voice_clone(project: Project, source_audio: bytes) -> str:
-    """Return the project's voice_id, cloning from the source audio if needed."""
+async def _ensure_voice_clone(project: Project, source_audio: bytes) -> Tuple[str, bool]:
+    """Return (voice_id, used_fallback). Clones the user's voice from the
+    source audio; if the ElevenLabs plan doesn't include Instant Voice
+    Cloning, falls back to a premade voice so the replace pipeline still
+    works (with a clear "fallback voice" label on the resulting version).
+    """
     if project.voice_id:
-        return project.voice_id
-    voice_id = await voice_service.clone_voice(
-        source_audio, name=f"sonicly-{project.id}-{project.name[:32]}"
-    )
-    project.voice_id = voice_id
-    project.voice_provider = "elevenlabs"
-    return voice_id
+        return project.voice_id, project.voice_provider == voice_service.FALLBACK_VOICE_PROVIDER
+    try:
+        voice_id = await voice_service.clone_voice(
+            source_audio, name=f"sonicly-{project.id}-{project.name[:32]}"
+        )
+        project.voice_id = voice_id
+        project.voice_provider = "elevenlabs"
+        return voice_id, False
+    except voice_service.VoiceError as exc:
+        if not exc.plan_upgrade_required:
+            raise
+        # Free-tier fallback: use a premade voice so the user can still
+        # exercise the feature end-to-end. The version label will say so.
+        project.voice_id = voice_service.FALLBACK_VOICE_ID
+        project.voice_provider = voice_service.FALLBACK_VOICE_PROVIDER
+        return voice_service.FALLBACK_VOICE_ID, True
 
 
 @router.post("/{project_id}/voice/clone", response_model=ProjectOut)
@@ -488,8 +501,18 @@ async def clone_project_voice(
         raise HTTPException(status_code=502, detail=f"Fetch source audio: {exc}")
 
     try:
-        await _ensure_voice_clone(project, audio_bytes)
+        _, used_fallback = await _ensure_voice_clone(project, audio_bytes)
     except voice_service.VoiceError as exc:
+        if exc.plan_upgrade_required:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "ElevenLabs Instant Voice Cloning requires a paid plan "
+                    "(Starter or higher). Upgrade at https://elevenlabs.io/pricing, "
+                    "or proceed with a built-in voice — the Confirm flow will use "
+                    "the premade voice automatically."
+                ),
+            )
         raise HTTPException(status_code=502, detail=str(exc))
 
     await db.commit()
@@ -576,10 +599,16 @@ async def apply_edits(
             raise HTTPException(status_code=500, detail="Could not probe audio duration")
 
         # If we have replaces, ensure a voice clone is attached.
+        used_fallback_voice = False
         if replace_refs:
             try:
-                await _ensure_voice_clone(project, src_bytes)
+                _, used_fallback_voice = await _ensure_voice_clone(project, src_bytes)
             except voice_service.VoiceError as exc:
+                if exc.plan_upgrade_required:
+                    raise HTTPException(
+                        status_code=402,
+                        detail=str(exc),
+                    )
                 raise HTTPException(status_code=502, detail=f"Voice clone: {exc}")
 
             # Generate one mp3 per replace, dump into the temp dir.
@@ -658,6 +687,8 @@ async def apply_edits(
     if replace_refs:
         parts.append(f"Replaced {len(replace_refs)}")
     default_label = " · ".join(parts) + " word" + ("s" if (len(delete_refs) + len(replace_refs)) != 1 else "")
+    if replace_refs and used_fallback_voice:
+        default_label += " (premade voice)"
 
     version = AudioVersion(
         project_id=project_id,

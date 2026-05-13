@@ -914,6 +914,12 @@ export default function Editor() {
                 </>
               )}
 
+              {editError && (
+                <div className="basis-full mt-1 text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1 break-words">
+                  {editError}
+                </div>
+              )}
+
               <span className="ml-auto flex items-center gap-2">
                 {transcriptState === 'ready' && (
                   voiceId ? (
@@ -934,7 +940,6 @@ export default function Editor() {
                     </button>
                   )
                 )}
-                {editError && <span className="text-xs text-red-500 max-w-[200px] truncate" title={editError}>{editError}</span>}
                 {pending.count > 0 && (
                   <>
                     <span className="text-xs text-gray-500">
