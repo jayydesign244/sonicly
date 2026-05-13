@@ -2,8 +2,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -20,7 +19,7 @@ class Project(Base):
     duration: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="New")
     audio_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
-    transcript: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    transcript: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     active_version_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False
@@ -43,8 +42,8 @@ class AudioVersion(Base):
     )
     label: Mapped[str] = mapped_column(String(128), default="Edit")
     audio_url: Mapped[str] = mapped_column(String(1024))
-    transcript: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    duration: Mapped[Optional[float]] = mapped_column(nullable=True)
+    transcript: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    duration: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False
     )

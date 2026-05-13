@@ -8,25 +8,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from routers import projects
 from auth import get_current_user, prefetch_jwks
-from database import engine
+from database import engine, IS_SQLITE
 from models.db import Base
 
 
 @asynccontextmanager
 async def lifespan(app):
     await prefetch_jwks()
-    if engine is not None:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            # Lightweight in-place migrations for columns added after first deploy.
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        # Lightweight in-place migrations for columns added after first deploy.
+        # Postgres-only: SQLite either has it (fresh create_all) or doesn't
+        # support ADD COLUMN IF NOT EXISTS on older versions.
+        if not IS_SQLITE:
             await conn.execute(
                 text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS transcript JSONB")
             )
             await conn.execute(
                 text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS active_version_id INTEGER")
             )
-    else:
-        print("[db] DATABASE_URL not set — running without persistence")
     yield
 
 app = FastAPI(

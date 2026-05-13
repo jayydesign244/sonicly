@@ -1,4 +1,5 @@
-"""Async SQLAlchemy setup for Supabase Postgres."""
+"""Async SQLAlchemy setup. Falls back to a local SQLite file for dev when
+DATABASE_URL is missing, so the API can boot without Supabase configured."""
 import os
 from typing import AsyncIterator
 
@@ -8,8 +9,12 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+DEV_SQLITE_URL = "sqlite+aiosqlite:///./sonicly_dev.db"
+
 
 def _normalize_url(url: str) -> str:
+    if not url:
+        return ""
     # Supabase shows postgres:// or postgresql://; SQLAlchemy needs +asyncpg
     if url.startswith("postgres://"):
         url = "postgresql+asyncpg://" + url[len("postgres://") :]
@@ -18,29 +23,25 @@ def _normalize_url(url: str) -> str:
     return url
 
 
-DATABASE_URL = _normalize_url(os.environ.get("DATABASE_URL", ""))
+_raw = os.environ.get("DATABASE_URL", "")
+DATABASE_URL = _normalize_url(_raw) or DEV_SQLITE_URL
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
-engine = (
-    create_async_engine(
+if IS_SQLITE:
+    engine = create_async_engine(DATABASE_URL, echo=False)
+    print(f"[db] DATABASE_URL not set — using local SQLite at {DATABASE_URL}")
+else:
+    engine = create_async_engine(
         DATABASE_URL,
         echo=False,
         pool_pre_ping=True,
         pool_size=5,
         max_overflow=5,
     )
-    if DATABASE_URL
-    else None
-)
 
-SessionLocal = (
-    async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    if engine is not None
-    else None
-)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:
-    if SessionLocal is None:
-        raise RuntimeError("DATABASE_URL is not configured")
     async with SessionLocal() as session:
         yield session

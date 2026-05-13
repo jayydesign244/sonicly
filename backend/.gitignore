@@ -4,3 +4,5 @@ venv/
 .env
 .DS_Store
 *.log
+*.db
+*.sqlite*

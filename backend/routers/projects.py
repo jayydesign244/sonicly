@@ -27,13 +27,28 @@ from auth import get_current_user
 from database import get_db
 from storage import upload_audio as storage_upload, is_configured as storage_configured
 from services import audio_editor, fillers as fillers_service
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
-openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
+
+_openai_client: Optional[AsyncOpenAI] = None
+
+
+def _get_openai_client() -> AsyncOpenAI:
+    """Lazy so the app can boot without OPENAI_API_KEY for non-AI endpoints."""
+    global _openai_client
+    if _openai_client is None:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="OPENAI_API_KEY not configured on the server",
+            )
+        _openai_client = AsyncOpenAI(api_key=api_key)
+    return _openai_client
 
 SYSTEM_PROMPT = (
     "You are Sonicly, an AI audio editing assistant inside a web app. "
@@ -234,7 +249,7 @@ async def transcribe_project(
     audio_buf.name = filename
 
     try:
-        result = await openai_client.audio.transcriptions.create(
+        result = await _get_openai_client().audio.transcriptions.create(
             model=WHISPER_MODEL,
             file=audio_buf,
             response_format="verbose_json",
@@ -269,7 +284,7 @@ async def chat(
 
     async def event_generator():
         try:
-            stream = await openai_client.chat.completions.create(
+            stream = await _get_openai_client().chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=messages,
                 stream=True,
