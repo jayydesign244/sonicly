@@ -7,11 +7,18 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from routers import projects
 from auth import get_current_user, prefetch_jwks
+from database import engine
+from models.db import Base
 
 
 @asynccontextmanager
 async def lifespan(app):
     await prefetch_jwks()
+    if engine is not None:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    else:
+        print("[db] DATABASE_URL not set — running without persistence")
     yield
 
 app = FastAPI(

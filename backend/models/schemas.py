@@ -38,6 +38,7 @@ class TokenResponse(BaseModel):
 
 class ProjectCreate(BaseModel):
     name: str
+    duration: Optional[str] = None
 
 
 class ProjectOut(BaseModel):
@@ -45,6 +46,7 @@ class ProjectOut(BaseModel):
     name: str
     duration: Optional[str] = None
     status: ProjectStatus = ProjectStatus.new
+    audio_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

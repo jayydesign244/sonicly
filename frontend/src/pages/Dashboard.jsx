@@ -1,21 +1,63 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Waveform from '../components/Waveform'
 import { useAuth } from '../context/AuthContext'
-
-const PROJECTS = [
-  { id: 1, name: 'podcast_episode_12', duration: '3:42', edited: '2 hours ago', status: 'In Progress', seed: 42 },
-  { id: 2, name: 'interview_sarah_may', duration: '18:04', edited: 'Yesterday', status: 'Exported', seed: 77 },
-  { id: 3, name: 'webinar_recording_q2', duration: '54:11', edited: '3 days ago', status: 'Exported', seed: 13 },
-  { id: 4, name: 'voice_memo_ideas', duration: '0:52', edited: '5 days ago', status: 'New', seed: 55 },
-  { id: 5, name: 'client_call_acme', duration: '22:18', edited: 'Last week', status: 'In Progress', seed: 88 },
-  { id: 6, name: 'product_demo_v2', duration: '7:30', edited: 'Last week', status: 'New', seed: 31 },
-]
+import {
+  listProjects,
+  createProject,
+  deleteProject,
+  uploadAudio,
+} from '../lib/api'
 
 const STATUS_STYLE = {
   'In Progress': 'bg-orange-50 text-orange-600 border-orange-100',
   'Exported': 'bg-emerald-50 text-emerald-600 border-emerald-100',
   'New': 'bg-gray-100 text-gray-500 border-gray-200',
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return null
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return `${m}:${s.toString().padStart(2, '0')}`
+}
+
+function relativeTime(iso) {
+  if (!iso) return ''
+  const then = new Date(iso).getTime()
+  if (Number.isNaN(then)) return ''
+  const diff = Math.max(0, (Date.now() - then) / 1000)
+  if (diff < 60) return 'just now'
+  if (diff < 3600) {
+    const m = Math.floor(diff / 60)
+    return `${m} minute${m === 1 ? '' : 's'} ago`
+  }
+  if (diff < 86400) {
+    const h = Math.floor(diff / 3600)
+    return `${h} hour${h === 1 ? '' : 's'} ago`
+  }
+  if (diff < 86400 * 2) return 'Yesterday'
+  if (diff < 86400 * 7) {
+    const d = Math.floor(diff / 86400)
+    return `${d} days ago`
+  }
+  if (diff < 86400 * 14) return 'Last week'
+  return new Date(iso).toLocaleDateString()
+}
+
+function getAudioDuration(blob) {
+  return new Promise((resolve) => {
+    const audio = document.createElement('audio')
+    audio.preload = 'metadata'
+    const url = URL.createObjectURL(blob)
+    audio.src = url
+    const done = (val) => {
+      URL.revokeObjectURL(url)
+      resolve(val)
+    }
+    audio.addEventListener('loadedmetadata', () => done(audio.duration))
+    audio.addEventListener('error', () => done(NaN))
+  })
 }
 
 function ThreeDotMenu({ onRename, onDuplicate, onDelete }) {
@@ -56,7 +98,8 @@ function ThreeDotMenu({ onRename, onDuplicate, onDelete }) {
   )
 }
 
-function ProjectCard({ project, onClick }) {
+function ProjectCard({ project, onClick, onDelete }) {
+  const edited = relativeTime(project.updated_at)
   return (
     <div
       onClick={onClick}
@@ -64,12 +107,12 @@ function ProjectCard({ project, onClick }) {
     >
       <div className="flex items-start justify-between mb-3">
         <div className="flex-1 min-w-0">
-          <Waveform seed={project.seed} height={32} bars={48} color="#6366f1" />
+          <Waveform seed={project.id * 17 + 3} height={32} bars={48} color="#6366f1" />
         </div>
         <ThreeDotMenu
           onRename={() => {}}
           onDuplicate={() => {}}
-          onDelete={() => {}}
+          onDelete={onDelete}
         />
       </div>
 
@@ -78,12 +121,12 @@ function ProjectCard({ project, onClick }) {
           {project.name}
         </p>
         <div className="flex items-center gap-2 text-xs text-gray-400">
-          <span>{project.duration}</span>
-          <span>·</span>
-          <span>Edited {project.edited}</span>
+          {project.duration && <span>{project.duration}</span>}
+          {project.duration && <span>·</span>}
+          <span>Edited {edited}</span>
         </div>
         <div>
-          <span className={`inline-flex text-xs font-medium px-2 py-0.5 rounded-full border ${STATUS_STYLE[project.status]}`}>
+          <span className={`inline-flex text-xs font-medium px-2 py-0.5 rounded-full border ${STATUS_STYLE[project.status] || STATUS_STYLE.New}`}>
             {project.status}
           </span>
         </div>
@@ -92,14 +135,140 @@ function ProjectCard({ project, onClick }) {
   )
 }
 
-function NewProjectModal({ onClose, onStart }) {
+function ProjectCardSkeleton() {
+  return (
+    <div className="card p-4">
+      <div className="h-8 bg-gray-100 rounded mb-3 animate-pulse" />
+      <div className="h-4 bg-gray-100 rounded w-2/3 mb-2 animate-pulse" />
+      <div className="h-3 bg-gray-100 rounded w-1/2 animate-pulse" />
+    </div>
+  )
+}
+
+function NewProjectModal({ onClose, onCreated, getToken }) {
+  const [mode, setMode] = useState('choose') // 'choose' | 'record'
+  const [name, setName] = useState('Untitled Project')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+  const fileInputRef = useRef(null)
+
+  // Recording state
+  const [recording, setRecording] = useState(false)
+  const [recordedBlob, setRecordedBlob] = useState(null)
+  const [elapsed, setElapsed] = useState(0)
+  const mediaRecorderRef = useRef(null)
+  const streamRef = useRef(null)
+  const chunksRef = useRef([])
+  const timerRef = useRef(null)
+
+  useEffect(() => () => {
+    if (timerRef.current) clearInterval(timerRef.current)
+    if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop())
+  }, [])
+
+  const handleFilePick = () => {
+    fileInputRef.current?.click()
+  }
+
+  const handleFileChange = async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setBusy(true)
+    setError(null)
+    try {
+      const projectName = name?.trim() || file.name.replace(/\.[^.]+$/, '')
+      const dur = await getAudioDuration(file)
+      const created = await createProject({
+        name: projectName,
+        duration: formatDuration(dur) || undefined,
+        getToken,
+      })
+      const uploaded = await uploadAudio({ id: created.id, file, getToken })
+      onCreated(uploaded || created)
+    } catch (err) {
+      setError(err.message || 'Failed to upload')
+      setBusy(false)
+    }
+  }
+
+  const startRecording = async () => {
+    setError(null)
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      streamRef.current = stream
+      const recorder = new MediaRecorder(stream)
+      mediaRecorderRef.current = recorder
+      chunksRef.current = []
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data)
+      }
+      recorder.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' })
+        setRecordedBlob(blob)
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach(t => t.stop())
+          streamRef.current = null
+        }
+      }
+      recorder.start()
+      setRecording(true)
+      setElapsed(0)
+      const startedAt = Date.now()
+      timerRef.current = setInterval(() => setElapsed((Date.now() - startedAt) / 1000), 250)
+    } catch (err) {
+      setError(err.message || 'Microphone access denied')
+    }
+  }
+
+  const stopRecording = () => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current)
+      timerRef.current = null
+    }
+    mediaRecorderRef.current?.stop()
+    setRecording(false)
+  }
+
+  const saveRecording = async () => {
+    if (!recordedBlob) return
+    setBusy(true)
+    setError(null)
+    try {
+      const dur = await getAudioDuration(recordedBlob)
+      const projectName = name?.trim() || 'Untitled Recording'
+      const ext = (recordedBlob.type.split('/')[1] || 'webm').split(';')[0]
+      const file = new File([recordedBlob], `${projectName}.${ext}`, { type: recordedBlob.type })
+      const created = await createProject({
+        name: projectName,
+        duration: formatDuration(dur) || undefined,
+        getToken,
+      })
+      const uploaded = await uploadAudio({ id: created.id, file, getToken })
+      onCreated(uploaded || created)
+    } catch (err) {
+      setError(err.message || 'Failed to save recording')
+      setBusy(false)
+    }
+  }
+
+  const discardRecording = () => {
+    setRecordedBlob(null)
+    setElapsed(0)
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={busy ? undefined : onClose} />
       <div className="relative card shadow-modal w-full max-w-md p-6 animate-slide-up">
         <div className="flex items-center justify-between mb-5">
-          <h2 className="text-base font-semibold text-gray-900">Start a new project</h2>
-          <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-gray-100 text-gray-400">
+          <h2 className="text-base font-semibold text-gray-900">
+            {mode === 'record' ? 'Record audio' : 'Start a new project'}
+          </h2>
+          <button
+            onClick={onClose}
+            disabled={busy}
+            className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-gray-100 text-gray-400 disabled:opacity-40"
+          >
             <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
             </svg>
@@ -111,41 +280,95 @@ function NewProjectModal({ onClose, onStart }) {
           <input
             type="text"
             className="input-field mb-5"
-            defaultValue="Untitled Project"
+            value={name}
+            onChange={e => setName(e.target.value)}
+            disabled={busy || recording}
           />
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
-          <button
-            onClick={onStart}
-            className="flex flex-col items-center gap-2.5 p-5 border-2 border-gray-200 hover:border-accent-400 hover:bg-accent-50 rounded-xl transition-colors group"
-          >
-            <div className="w-10 h-10 bg-gray-100 group-hover:bg-accent-100 rounded-xl flex items-center justify-center text-gray-500 group-hover:text-accent-500 transition-colors">
-              <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
-              </svg>
-            </div>
-            <div className="text-center">
-              <div className="text-sm font-medium text-gray-900">Upload a file</div>
-              <div className="text-xs text-gray-400 mt-0.5">MP3, WAV, M4A, FLAC</div>
-            </div>
-          </button>
+        {mode === 'choose' && (
+          <div className="grid grid-cols-2 gap-3">
+            <button
+              onClick={handleFilePick}
+              disabled={busy}
+              className="flex flex-col items-center gap-2.5 p-5 border-2 border-gray-200 hover:border-accent-400 hover:bg-accent-50 rounded-xl transition-colors group disabled:opacity-50"
+            >
+              <div className="w-10 h-10 bg-gray-100 group-hover:bg-accent-100 rounded-xl flex items-center justify-center text-gray-500 group-hover:text-accent-500 transition-colors">
+                <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                </svg>
+              </div>
+              <div className="text-center">
+                <div className="text-sm font-medium text-gray-900">
+                  {busy ? 'Uploading…' : 'Upload a file'}
+                </div>
+                <div className="text-xs text-gray-400 mt-0.5">MP3, WAV, M4A, FLAC</div>
+              </div>
+            </button>
 
-          <button
-            onClick={onStart}
-            className="flex flex-col items-center gap-2.5 p-5 border-2 border-gray-200 hover:border-accent-400 hover:bg-accent-50 rounded-xl transition-colors group"
-          >
-            <div className="w-10 h-10 bg-gray-100 group-hover:bg-accent-100 rounded-xl flex items-center justify-center text-gray-500 group-hover:text-accent-500 transition-colors">
-              <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+            <button
+              onClick={() => setMode('record')}
+              disabled={busy}
+              className="flex flex-col items-center gap-2.5 p-5 border-2 border-gray-200 hover:border-accent-400 hover:bg-accent-50 rounded-xl transition-colors group disabled:opacity-50"
+            >
+              <div className="w-10 h-10 bg-gray-100 group-hover:bg-accent-100 rounded-xl flex items-center justify-center text-gray-500 group-hover:text-accent-500 transition-colors">
+                <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                </svg>
+              </div>
+              <div className="text-center">
+                <div className="text-sm font-medium text-gray-900">Record audio</div>
+                <div className="text-xs text-gray-400 mt-0.5">Record in the browser</div>
+              </div>
+            </button>
+          </div>
+        )}
+
+        {mode === 'record' && (
+          <div className="flex flex-col items-center gap-4 py-4">
+            <div className={`w-20 h-20 rounded-full flex items-center justify-center ${recording ? 'bg-red-50 animate-pulse' : recordedBlob ? 'bg-emerald-50' : 'bg-gray-100'}`}>
+              <svg width="36" height="36" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} className={recording ? 'text-red-500' : recordedBlob ? 'text-emerald-500' : 'text-gray-500'}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
               </svg>
             </div>
-            <div className="text-center">
-              <div className="text-sm font-medium text-gray-900">Record audio</div>
-              <div className="text-xs text-gray-400 mt-0.5">Record in the browser</div>
+
+            <div className="font-mono text-lg text-gray-900 tabular-nums">
+              {formatDuration(elapsed) || '0:00'}
             </div>
-          </button>
-        </div>
+
+            <div className="flex items-center gap-3">
+              {!recording && !recordedBlob && (
+                <>
+                  <button onClick={() => setMode('choose')} className="btn-ghost" disabled={busy}>Back</button>
+                  <button onClick={startRecording} className="btn-primary" disabled={busy}>Start recording</button>
+                </>
+              )}
+              {recording && (
+                <button onClick={stopRecording} className="btn-primary">Stop</button>
+              )}
+              {!recording && recordedBlob && (
+                <>
+                  <button onClick={discardRecording} className="btn-ghost" disabled={busy}>Re-record</button>
+                  <button onClick={saveRecording} className="btn-primary" disabled={busy}>
+                    {busy ? 'Saving…' : 'Save recording'}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
+        {error && (
+          <p className="mt-4 text-xs text-red-500">{error}</p>
+        )}
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="audio/*"
+          className="hidden"
+          onChange={handleFileChange}
+        />
       </div>
     </div>
   )
@@ -153,20 +376,41 @@ function NewProjectModal({ onClose, onStart }) {
 
 export default function Dashboard() {
   const navigate = useNavigate()
-  const { user, signOut } = useAuth()
+  const { user, signOut, getToken } = useAuth()
   const [showNewProject, setShowNewProject] = useState(false)
   const [showUserMenu, setShowUserMenu] = useState(false)
   const [search, setSearch] = useState('')
+  const [projects, setProjects] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
 
   const displayName = user?.user_metadata?.name || user?.email?.split('@')[0] || 'You'
   const initials = displayName.split(' ').map(s => s[0]).slice(0, 2).join('').toUpperCase()
+
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      setLoading(true)
+      setError(null)
+      try {
+        const data = await listProjects({ getToken })
+        if (!cancelled) setProjects(data || [])
+      } catch (err) {
+        if (!cancelled) setError(err.message || 'Failed to load projects')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    load()
+    return () => { cancelled = true }
+  }, [getToken])
 
   const handleSignOut = async () => {
     await signOut()
     navigate('/')
   }
 
-  const filtered = PROJECTS.filter(p =>
+  const filtered = projects.filter(p =>
     p.name.toLowerCase().includes(search.toLowerCase())
   )
 
@@ -174,9 +418,21 @@ export default function Dashboard() {
     navigate('/processing', { state: { project } })
   }
 
-  const handleNewProjectStart = () => {
+  const handleProjectCreated = (project) => {
+    setProjects(prev => [project, ...prev])
     setShowNewProject(false)
-    navigate('/processing', { state: { project: { id: 99, name: 'Untitled Project', duration: '0:00', seed: 64 } } })
+    navigate('/processing', { state: { project } })
+  }
+
+  const handleDelete = async (project) => {
+    const prev = projects
+    setProjects(p => p.filter(x => x.id !== project.id))
+    try {
+      await deleteProject({ id: project.id, getToken })
+    } catch (err) {
+      setProjects(prev)
+      setError(err.message || 'Failed to delete project')
+    }
   }
 
   return (
@@ -295,20 +551,37 @@ export default function Dashboard() {
         </div>
 
         <div className="p-6">
-          {filtered.length === 0 ? (
-            /* Empty state */
+          {error && (
+            <div className="mb-4 px-3 py-2 text-xs text-red-600 bg-red-50 border border-red-100 rounded-lg">
+              {error}
+            </div>
+          )}
+
+          {loading ? (
+            <div className="grid grid-cols-3 gap-4 xl:grid-cols-3 lg:grid-cols-2">
+              {Array.from({ length: 6 }).map((_, i) => <ProjectCardSkeleton key={i} />)}
+            </div>
+          ) : filtered.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-24 text-center">
               <div className="w-14 h-14 bg-gray-100 rounded-2xl flex items-center justify-center mb-4">
                 <svg width="24" height="24" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} className="text-gray-400">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
                 </svg>
               </div>
-              <h3 className="text-sm font-semibold text-gray-900 mb-1">No projects yet</h3>
-              <p className="text-sm text-gray-400 mb-6">Upload an audio file or start recording to get started.</p>
-              <div className="flex items-center gap-3">
-                <button onClick={() => setShowNewProject(true)} className="btn-primary">Upload a file</button>
-                <button onClick={() => setShowNewProject(true)} className="btn-ghost">Start recording</button>
-              </div>
+              <h3 className="text-sm font-semibold text-gray-900 mb-1">
+                {projects.length === 0 ? 'No projects yet' : 'No results'}
+              </h3>
+              <p className="text-sm text-gray-400 mb-6">
+                {projects.length === 0
+                  ? 'Upload an audio file or start recording to get started.'
+                  : 'Try a different search.'}
+              </p>
+              {projects.length === 0 && (
+                <div className="flex items-center gap-3">
+                  <button onClick={() => setShowNewProject(true)} className="btn-primary">Upload a file</button>
+                  <button onClick={() => setShowNewProject(true)} className="btn-ghost">Start recording</button>
+                </div>
+              )}
             </div>
           ) : (
             <div className="grid grid-cols-3 gap-4 xl:grid-cols-3 lg:grid-cols-2">
@@ -317,6 +590,7 @@ export default function Dashboard() {
                   key={project.id}
                   project={project}
                   onClick={() => handleProjectClick(project)}
+                  onDelete={() => handleDelete(project)}
                 />
               ))}
             </div>
@@ -327,7 +601,8 @@ export default function Dashboard() {
       {showNewProject && (
         <NewProjectModal
           onClose={() => setShowNewProject(false)}
-          onStart={handleNewProjectStart}
+          onCreated={handleProjectCreated}
+          getToken={getToken}
         />
       )}
     </div>

@@ -7,3 +7,5 @@ passlib[bcrypt]==1.7.4
 aiofiles==23.2.1
 python-dotenv==1.0.1
 openai>=2.36.0
+sqlalchemy[asyncio]>=2.0.30
+asyncpg>=0.29.0
