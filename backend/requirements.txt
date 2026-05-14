@@ -9,3 +9,5 @@ python-dotenv==1.0.1
 openai>=2.36.0
 sqlalchemy[asyncio]>=2.0.30
 asyncpg>=0.29.0
+aiosqlite>=0.20.0
+imageio-ffmpeg>=0.5.1

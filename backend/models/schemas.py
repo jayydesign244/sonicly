@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr
-from typing import Optional, List
+from typing import Any, Optional, List
 from datetime import datetime
 from enum import Enum
 
@@ -47,11 +47,76 @@ class ProjectOut(BaseModel):
     duration: Optional[str] = None
     status: ProjectStatus = ProjectStatus.new
     audio_url: Optional[str] = None
+    transcript: Optional[dict] = None
+    active_version_id: Optional[int] = None
+    voice_id: Optional[str] = None
+    voice_provider: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class AudioVersionOut(BaseModel):
+    id: int
+    project_id: int
+    parent_id: Optional[int] = None
+    label: str
+    audio_url: str
+    transcript: Optional[dict] = None
+    duration: Optional[float] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class WordRef(BaseModel):
+    segment_idx: int
+    word_idx: int
+
+
+class DeleteEdit(BaseModel):
+    type: str = "delete"
+    words: List[WordRef]
+
+
+class ReplaceEdit(BaseModel):
+    type: str = "replace"
+    word: WordRef
+    new_text: str
+
+
+class ApplyEditsRequest(BaseModel):
+    parent_version_id: Optional[int] = None
+    label: Optional[str] = None
+    edits: List[dict]
+
+
+class FillersResponse(BaseModel):
+    fillers: List[WordRef]
+    total: int
+
+
+class TranscriptWord(BaseModel):
+    text: str
+    start: float
+    end: float
+
+
+class TranscriptSegment(BaseModel):
+    start: float
+    end: float
+    text: str
+    words: List[TranscriptWord]
+
+
+class Transcript(BaseModel):
+    language: Optional[str] = None
+    duration: Optional[float] = None
+    text: str
+    segments: List[TranscriptSegment]
 
 
 class ChatMessage(BaseModel):

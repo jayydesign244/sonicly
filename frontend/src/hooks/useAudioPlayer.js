@@ -60,13 +60,20 @@ export function useAudioPlayer({ url, height = 60, color = '#6366f1', ghostColor
     const next = Math.max(0, Math.min(ws.getDuration(), ws.getCurrentTime() + seconds))
     ws.setTime(next)
   }
+  const seek = (time, { play } = {}) => {
+    const ws = wsRef.current
+    if (!ws) return
+    const clamped = Math.max(0, Math.min(ws.getDuration() || time, time))
+    ws.setTime(clamped)
+    if (play && !ws.isPlaying()) ws.play()
+  }
   const setVolume = (v) => wsRef.current?.setVolume(v)
   const setRate = (r) => wsRef.current?.setPlaybackRate(r, true)
 
   return {
     containerRef,
     isPlaying, isReady, currentTime, duration, error,
-    toggle, skip, setVolume, setRate,
+    toggle, skip, seek, setVolume, setRate,
   }
 }
 

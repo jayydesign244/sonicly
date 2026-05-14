@@ -1,31 +1,28 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useMemo } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Waveform from '../components/Waveform'
 import { useAuth } from '../context/AuthContext'
-import { streamChat } from '../lib/api'
+import {
+  streamChat,
+  transcribeAudio,
+  getProject,
+  detectFillers,
+  applyEdits,
+  listVersions,
+  activateVersion,
+  cloneVoice,
+} from '../lib/api'
 import { useAudioPlayer, formatTime } from '../hooks/useAudioPlayer'
+import { usePendingEdits } from '../hooks/usePendingEdits'
 
 const INITIAL_MESSAGES = []
 
-const TRANSCRIPT_LINES = [
-  { time: '00:00', text: 'Welcome back to the show. Today we are talking about, um, the future of AI in audio editing.' },
-  { time: '00:14', text: 'So like I was saying last week, the tools have gotten, uh, remarkably good over the past year.' },
-  { time: '00:28', text: 'Our guest today has been building in this space for three years and has some really interesting perspective.' },
-  { time: '00:42', text: 'Yeah thanks for having me. So, uh, the thing that surprises most people is how, like, accessible this has become.' },
-  { time: '00:58', text: 'Before you needed a studio, expensive equipment, a professional engineer. Now literally anyone can do it.' },
-  { time: '01:12', text: 'And the quality is, honestly, um, better than what I was getting in a physical studio two years ago.' },
-  { time: '01:28', text: 'The noise removal alone is, like, incredible. Thirty seconds and you have a clean recording.' },
-  { time: '01:44', text: 'We have been using it for our entire catalog. About, uh, two hundred episodes reprocessed.' },
-  { time: '02:00', text: 'The feedback from listeners has been overwhelmingly positive. They notice the difference immediately.' },
-]
-
-const FILLER_WORDS = ['um,', 'uh,', 'like,', 'So,']
-
-const VERSIONS = [
-  { id: 'original', label: 'Original' },
-  { id: 'noise', label: 'After noise removal' },
-  { id: 'warmth', label: 'After voice warmth' },
-]
+const fmtMMSS = (s) => {
+  if (!Number.isFinite(s) || s < 0) s = 0
+  const m = Math.floor(s / 60)
+  const sec = Math.floor(s % 60)
+  return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`
+}
 
 const QUICK_CHIPS = [
   { icon: '🎙️', label: 'Clean up audio' },
@@ -302,16 +299,30 @@ export default function Editor() {
   const [showDiagnosis, setShowDiagnosis] = useState(true)
   const [messages, setMessages] = useState(INITIAL_MESSAGES)
   const [inputText, setInputText] = useState('')
-  const [activeVersion, setActiveVersion] = useState('warmth')
   const [isEditingName, setIsEditingName] = useState(false)
   const [projectName, setProjectName] = useState(project.name || 'podcast_episode_12')
   const [selectedWord, setSelectedWord] = useState(null)
   const [isStreaming, setIsStreaming] = useState(false)
   const [volume, setVolumeState] = useState(80)
   const [rate, setRateState] = useState('1')
+  const [transcript, setTranscript] = useState(project.transcript || null)
+  const [transcriptState, setTranscriptState] = useState(
+    project.transcript ? 'ready' : project.audio_url ? 'idle' : 'no-audio'
+  )
+  const [transcriptError, setTranscriptError] = useState(null)
+  const [audioUrl, setAudioUrl] = useState(project.audio_url || null)
+  const [fillerRefs, setFillerRefs] = useState([])
+  const [versions, setVersions] = useState([])
+  const [activeVersionId, setActiveVersionId] = useState(project.active_version_id || null)
+  const [applyingEdits, setApplyingEdits] = useState(false)
+  const [editError, setEditError] = useState(null)
+  const [voiceId, setVoiceId] = useState(project.voice_id || null)
+  const [voiceCloning, setVoiceCloning] = useState(false)
+  const [inlineEdit, setInlineEdit] = useState(null) // { si, wi, text }
+  const pending = usePendingEdits()
   const chatEndRef = useRef(null)
+  const activeWordRef = useRef(null)
 
-  const audioUrl = project.audio_url || null
   const player = useAudioPlayer({ url: audioUrl })
 
   useEffect(() => {
@@ -321,6 +332,196 @@ export default function Editor() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [player.isReady])
+
+  // Load existing transcript (in case Editor was opened with only an id),
+  // or kick off transcription if audio exists but no transcript yet.
+  useEffect(() => {
+    let cancelled = false
+    async function run() {
+      if (!project.id) return
+      try {
+        const fresh = await getProject({ id: project.id, getToken })
+        if (cancelled) return
+        setAudioUrl(fresh.audio_url || null)
+        setActiveVersionId(fresh.active_version_id || null)
+        setVoiceId(fresh.voice_id || null)
+        if (fresh.transcript) {
+          setTranscript(fresh.transcript)
+          setTranscriptState('ready')
+        } else if (!fresh.audio_url) {
+          setTranscriptState('no-audio')
+          return
+        } else {
+          setTranscriptState('transcribing')
+          const updated = await transcribeAudio({ id: project.id, getToken })
+          if (cancelled) return
+          setTranscript(updated.transcript || null)
+          setAudioUrl(updated.audio_url || fresh.audio_url || null)
+          setTranscriptState(updated.transcript ? 'ready' : 'idle')
+        }
+        // Fire-and-forget side loads.
+        listVersions({ id: project.id, getToken }).then(v => {
+          if (!cancelled) setVersions(v || [])
+        }).catch(() => {})
+      } catch (err) {
+        if (cancelled) return
+        setTranscriptError(err.message)
+        setTranscriptState('error')
+      }
+    }
+    run()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.id])
+
+  // Whenever the transcript changes (loaded, edited, version switched),
+  // re-detect fillers on the server.
+  useEffect(() => {
+    let cancelled = false
+    if (!project.id || transcriptState !== 'ready') {
+      setFillerRefs([])
+      return
+    }
+    detectFillers({ id: project.id, getToken })
+      .then(res => { if (!cancelled) setFillerRefs(res?.fillers || []) })
+      .catch(() => { if (!cancelled) setFillerRefs([]) })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.id, transcript, transcriptState])
+
+  // Find which word is currently being spoken — for live highlight.
+  const activeWordKey = useMemo(() => {
+    if (!transcript?.segments?.length) return null
+    const t = player.currentTime
+    for (let si = 0; si < transcript.segments.length; si++) {
+      const seg = transcript.segments[si]
+      if (t < seg.start - 0.05) break
+      if (t > seg.end + 0.25) continue
+      for (let wi = 0; wi < seg.words.length; wi++) {
+        const w = seg.words[wi]
+        if (t >= w.start && t <= w.end + 0.05) return `${si}-${wi}`
+      }
+    }
+    return null
+  }, [player.currentTime, transcript])
+
+  useEffect(() => {
+    if (activeWordRef.current) {
+      activeWordRef.current.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    }
+  }, [activeWordKey])
+
+  const wordCount = useMemo(() => {
+    if (!transcript?.segments) return 0
+    return transcript.segments.reduce((acc, s) => acc + s.words.length, 0)
+  }, [transcript])
+
+  // Filler word lookup — built from the server response, not heuristics.
+  const fillerSet = useMemo(() => {
+    const s = new Set()
+    for (const f of fillerRefs) s.add(`${f.segment_idx}-${f.word_idx}`)
+    return s
+  }, [fillerRefs])
+
+  const isFillerWord = (si, wi) => fillerSet.has(`${si}-${wi}`)
+
+  const handleRemoveAllFillers = () => {
+    if (!fillerRefs.length) return
+    pending.queueDeletes(fillerRefs)
+  }
+
+  const handleCancelEdits = () => {
+    pending.clear()
+    setEditError(null)
+  }
+
+  const handleConfirmEdits = async () => {
+    if (!pending.count || !project.id) return
+    setApplyingEdits(true)
+    setEditError(null)
+    try {
+      const version = await applyEdits({
+        id: project.id,
+        edits: pending.serialize(),
+        parentVersionId: activeVersionId,
+        getToken,
+      })
+      pending.clear()
+      setActiveVersionId(version.id)
+      if (version.audio_url) setAudioUrl(version.audio_url)
+      if (version.transcript) setTranscript(version.transcript)
+      const [freshVersions, freshProject] = await Promise.all([
+        listVersions({ id: project.id, getToken }),
+        getProject({ id: project.id, getToken }),
+      ])
+      setVersions(freshVersions || [])
+      if (freshProject?.voice_id) setVoiceId(freshProject.voice_id)
+    } catch (err) {
+      setEditError(err.message)
+    } finally {
+      setApplyingEdits(false)
+    }
+  }
+
+  const handleCloneVoice = async () => {
+    if (!project.id || voiceCloning) return
+    setVoiceCloning(true)
+    setEditError(null)
+    try {
+      const updated = await cloneVoice({ id: project.id, getToken })
+      setVoiceId(updated.voice_id || null)
+    } catch (err) {
+      setEditError(err.message)
+    } finally {
+      setVoiceCloning(false)
+    }
+  }
+
+  const beginInlineEdit = (si, wi, currentText) => {
+    setSelectedWord(null)
+    setInlineEdit({ si, wi, text: (currentText || '').trim() })
+  }
+
+  const commitInlineEdit = () => {
+    if (!inlineEdit) return
+    const trimmed = inlineEdit.text.trim()
+    const original = transcript?.segments?.[inlineEdit.si]?.words?.[inlineEdit.wi]?.text?.trim() || ''
+    if (trimmed && trimmed !== original) {
+      pending.queueReplace(inlineEdit.si, inlineEdit.wi, trimmed)
+    }
+    setInlineEdit(null)
+  }
+
+  const cancelInlineEdit = () => setInlineEdit(null)
+
+  const handleActivateVersion = async (versionId) => {
+    if (!project.id || versionId === activeVersionId) return
+    setApplyingEdits(true)
+    try {
+      const updated = await activateVersion({ id: project.id, versionId, getToken })
+      setActiveVersionId(versionId)
+      if (updated.audio_url) setAudioUrl(updated.audio_url)
+      if (updated.transcript) setTranscript(updated.transcript)
+    } catch (err) {
+      setEditError(err.message)
+    } finally {
+      setApplyingEdits(false)
+    }
+  }
+
+  const retryTranscribe = async () => {
+    if (!project.id) return
+    setTranscriptError(null)
+    setTranscriptState('transcribing')
+    try {
+      const updated = await transcribeAudio({ id: project.id, getToken })
+      setTranscript(updated.transcript || null)
+      setTranscriptState(updated.transcript ? 'ready' : 'idle')
+    } catch (err) {
+      setTranscriptError(err.message)
+      setTranscriptState('error')
+    }
+  }
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -367,8 +568,6 @@ export default function Editor() {
     setShowDiagnosis(false)
     sendToAI('Fix all three issues: background noise, room reverb, and filler words.')
   }
-
-  const isFillerWord = (word) => FILLER_WORDS.some(fw => word.toLowerCase().includes(fw.toLowerCase().replace(',', '')))
 
   return (
     <div className="h-screen flex flex-col bg-white overflow-hidden">
@@ -657,66 +856,251 @@ export default function Editor() {
             </div>
 
             {/* Version history */}
-            <div className="flex items-center gap-1.5 mt-3 overflow-x-auto">
-              {VERSIONS.map(v => (
-                <button
-                  key={v.id}
-                  onClick={() => setActiveVersion(v.id)}
-                  className={`flex-shrink-0 text-xs px-2.5 py-1 rounded-full border transition-colors ${
-                    activeVersion === v.id
-                      ? 'bg-accent-500 text-white border-accent-500'
-                      : 'border-gray-200 text-gray-500 hover:border-gray-300 hover:text-gray-700'
-                  }`}
-                >
-                  {v.label}
-                </button>
-              ))}
-              <button className="flex-shrink-0 w-6 h-6 border border-dashed border-gray-300 rounded-full text-gray-400 flex items-center justify-center text-xs hover:border-gray-400 transition-colors">
-                +
-              </button>
+            <div className="flex items-center gap-1.5 mt-3 overflow-x-auto no-scrollbar">
+              {versions.length === 0 ? (
+                <span className="text-xs text-gray-400">Original</span>
+              ) : (
+                <>
+                  <button
+                    onClick={() => handleActivateVersion(null)}
+                    disabled={applyingEdits}
+                    className={`flex-shrink-0 text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                      activeVersionId == null
+                        ? 'bg-accent-500 text-white border-accent-500'
+                        : 'border-gray-200 text-gray-500 hover:border-gray-300 hover:text-gray-700'
+                    } disabled:opacity-50`}
+                    title="Original audio"
+                  >
+                    Original
+                  </button>
+                  {versions.map(v => (
+                    <button
+                      key={v.id}
+                      onClick={() => handleActivateVersion(v.id)}
+                      disabled={applyingEdits}
+                      className={`flex-shrink-0 text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                        activeVersionId === v.id
+                          ? 'bg-accent-500 text-white border-accent-500'
+                          : 'border-gray-200 text-gray-500 hover:border-gray-300 hover:text-gray-700'
+                      } disabled:opacity-50`}
+                      title={new Date(v.created_at).toLocaleString()}
+                    >
+                      {v.label}
+                    </button>
+                  ))}
+                </>
+              )}
             </div>
           </div>
 
           {/* BOTTOM HALF — Transcript */}
           <div className="flex-1 flex flex-col min-h-0">
-            <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100 flex-shrink-0">
+            <div className="px-5 py-2.5 border-b border-gray-100 flex-shrink-0 flex items-center gap-3 flex-wrap">
               <span className="text-xs font-semibold text-gray-700">Transcript</span>
-              <span className="text-xs text-gray-400">Edit to change audio</span>
+
+              {transcriptState === 'ready' && (
+                <>
+                  <span className="text-xs text-gray-400">
+                    {fillerRefs.length} filler{fillerRefs.length === 1 ? '' : 's'} detected
+                  </span>
+                  {fillerRefs.length > 0 && (
+                    <button
+                      onClick={handleRemoveAllFillers}
+                      className="text-xs px-2 py-1 rounded-md border border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100 transition-colors"
+                    >
+                      ✂︎ Remove all fillers
+                    </button>
+                  )}
+                </>
+              )}
+
+              {editError && (
+                <div className="basis-full mt-1 text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1 break-words">
+                  {editError}
+                </div>
+              )}
+
+              <span className="ml-auto flex items-center gap-2">
+                {transcriptState === 'ready' && (
+                  voiceId ? (
+                    <span
+                      className="text-[11px] px-1.5 py-0.5 rounded-full bg-violet-50 text-violet-700 border border-violet-200"
+                      title="Voice clone ready — edited words will be regenerated in this voice"
+                    >
+                      🎙 Voice ready
+                    </span>
+                  ) : (
+                    <button
+                      onClick={handleCloneVoice}
+                      disabled={voiceCloning || !audioUrl}
+                      className="text-[11px] px-1.5 py-0.5 rounded-full bg-gray-50 border border-gray-200 text-gray-600 hover:bg-violet-50 hover:text-violet-700 hover:border-violet-200 disabled:opacity-40"
+                      title="Clone your voice from this audio so edited words can be regenerated"
+                    >
+                      {voiceCloning ? '🎙 Cloning…' : '🎙 Clone voice'}
+                    </button>
+                  )
+                )}
+                {pending.count > 0 && (
+                  <>
+                    <span className="text-xs text-gray-500">
+                      {pending.deleteCount > 0 && `${pending.deleteCount} delete${pending.deleteCount === 1 ? '' : 's'}`}
+                      {pending.deleteCount > 0 && pending.replaceCount > 0 && ' · '}
+                      {pending.replaceCount > 0 && `${pending.replaceCount} replace${pending.replaceCount === 1 ? '' : 's'}`}
+                    </span>
+                    <button
+                      onClick={pending.undo}
+                      disabled={applyingEdits}
+                      className="text-xs text-gray-500 hover:text-gray-700 disabled:opacity-40"
+                    >
+                      Undo
+                    </button>
+                    <button
+                      onClick={handleCancelEdits}
+                      disabled={applyingEdits}
+                      className="text-xs text-gray-500 hover:text-gray-700 disabled:opacity-40"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleConfirmEdits}
+                      disabled={applyingEdits}
+                      className="btn-primary text-xs py-1 px-2.5 disabled:opacity-60"
+                    >
+                      {applyingEdits ? (pending.replaceCount > 0 ? 'Regenerating…' : 'Applying…') : 'Confirm'}
+                    </button>
+                  </>
+                )}
+                {pending.count === 0 && (
+                  <span className="text-xs text-gray-400 hidden md:inline">
+                    Click delete · Double-click edit · Shift+click jump
+                  </span>
+                )}
+              </span>
             </div>
 
             <div className="flex-1 overflow-y-auto px-5 py-3 space-y-1">
-              {TRANSCRIPT_LINES.map((line, i) => (
+              {transcriptState === 'no-audio' && (
+                <div className="h-full flex items-center justify-center text-xs text-gray-400">
+                  Upload audio to generate a transcript.
+                </div>
+              )}
+              {transcriptState === 'transcribing' && (
+                <div className="h-full flex flex-col items-center justify-center gap-2 text-xs text-gray-400">
+                  <div className="w-5 h-5 border-2 border-accent-400 border-t-transparent rounded-full animate-spin" />
+                  Transcribing audio…
+                </div>
+              )}
+              {transcriptState === 'error' && (
+                <div className="h-full flex flex-col items-center justify-center gap-2 text-xs text-red-500 text-center px-4">
+                  <span>Transcription failed.</span>
+                  {transcriptError && <span className="text-gray-400">{transcriptError}</span>}
+                  <button onClick={retryTranscribe} className="btn-ghost text-xs mt-1">Retry</button>
+                </div>
+              )}
+              {transcriptState === 'ready' && transcript?.segments?.map((seg, i) => (
                 <div
                   key={i}
                   className="flex gap-4 py-1.5 px-2 rounded-lg hover:bg-gray-50 group cursor-default transition-colors"
                 >
                   <button
                     className="text-xs font-mono text-gray-300 group-hover:text-accent-400 flex-shrink-0 pt-0.5 w-10 text-right transition-colors"
-                    onClick={() => {}}
+                    onClick={() => player.seek(seg.start, { play: true })}
+                    title="Jump to this line"
                   >
-                    {line.time}
+                    {fmtMMSS(seg.start)}
                   </button>
                   <p className="text-sm text-gray-700 leading-relaxed flex-1 flex flex-wrap gap-x-1">
-                    {line.text.split(' ').map((word, wi) => {
-                      const isFiller = isFillerWord(word)
+                    {seg.words.map((w, wi) => {
+                      const key = `${i}-${wi}`
+                      const filler = isFillerWord(i, wi)
+                      const deleted = pending.isDeleted(i, wi)
+                      const replacedTo = pending.replacedText(i, wi)
+                      const replaced = replacedTo !== undefined
+                      const active = activeWordKey === key
+                      const selected = selectedWord === key
+                      const editing = inlineEdit && inlineEdit.si === i && inlineEdit.wi === wi
+                      const original = (w.text || '').trim()
+
+                      if (editing) {
+                        return (
+                          <span key={wi} className="relative inline-block">
+                            <input
+                              autoFocus
+                              value={inlineEdit.text}
+                              onChange={e => setInlineEdit(s => ({ ...s, text: e.target.value }))}
+                              onBlur={commitInlineEdit}
+                              onKeyDown={e => {
+                                if (e.key === 'Enter') { e.preventDefault(); commitInlineEdit() }
+                                if (e.key === 'Escape') { e.preventDefault(); cancelInlineEdit() }
+                              }}
+                              className="px-1 py-0 -my-0.5 text-sm bg-violet-50 border border-violet-300 rounded outline-none focus:ring-1 focus:ring-violet-400 min-w-[60px]"
+                              size={Math.max(inlineEdit.text.length, 4)}
+                            />{' '}
+                          </span>
+                        )
+                      }
+
+                      const onWordClick = (e) => {
+                        if (e.shiftKey) {
+                          player.seek(w.start, { play: true })
+                          return
+                        }
+                        if (e.altKey || e.metaKey) {
+                          beginInlineEdit(i, wi, original)
+                          return
+                        }
+                        pending.toggleDelete(i, wi)
+                      }
                       return (
                         <span
                           key={wi}
-                          onClick={() => setSelectedWord(selectedWord === `${i}-${wi}` ? null : `${i}-${wi}`)}
-                          className={`cursor-pointer relative inline-block ${
-                            isFiller
-                              ? 'bg-amber-50 text-amber-700 rounded px-0.5 underline decoration-amber-300 decoration-dotted underline-offset-2'
+                          ref={active ? activeWordRef : null}
+                          onClick={onWordClick}
+                          onDoubleClick={(e) => { e.preventDefault(); beginInlineEdit(i, wi, original) }}
+                          onContextMenu={(e) => {
+                            e.preventDefault()
+                            setSelectedWord(selected ? null : key)
+                          }}
+                          title={
+                            deleted ? 'Click to undo delete'
+                            : replaced ? `Will be replaced with "${replacedTo}" · Click to undo`
+                            : 'Click to delete · Double-click to edit · Shift+click to jump · Right-click for more'
+                          }
+                          className={`cursor-pointer relative inline-block transition-colors ${
+                            deleted
+                              ? 'text-red-400 line-through decoration-red-300'
+                              : replaced
+                              ? 'text-violet-700 bg-violet-50 rounded px-0.5 underline decoration-violet-400 decoration-2 underline-offset-2'
+                              : active
+                              ? 'bg-accent-100 text-accent-700 rounded'
+                              : filler
+                              ? 'bg-amber-50 text-amber-700 rounded px-0.5 underline decoration-amber-400 decoration-dotted underline-offset-2'
                               : 'hover:text-accent-600 hover:underline hover:underline-offset-2 hover:decoration-accent-300'
-                          } ${selectedWord === `${i}-${wi}` ? 'bg-accent-50 text-accent-600 rounded' : ''}`}
+                          } ${selected ? 'ring-1 ring-accent-300 rounded' : ''}`}
                         >
-                          {word}{' '}
-                          {selectedWord === `${i}-${wi}` && (
+                          {replaced ? replacedTo : original}{' '}
+                          {selected && (
                             <span className="absolute -top-8 left-0 z-10 flex items-center gap-1 bg-gray-900 text-white text-xs rounded-lg px-2 py-1 whitespace-nowrap shadow-lg animate-fade-in">
-                              <button className="hover:text-accent-300 transition-colors">✏️ Edit</button>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); player.seek(w.start, { play: true }); setSelectedWord(null) }}
+                                className="hover:text-accent-300 transition-colors"
+                              >
+                                ▶ Jump
+                              </button>
                               <span className="text-gray-600">·</span>
-                              <button className="hover:text-red-300 transition-colors">🗑️ Delete</button>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); beginInlineEdit(i, wi, original) }}
+                                className="hover:text-violet-300 transition-colors"
+                              >
+                                ✏️ Edit
+                              </button>
                               <span className="text-gray-600">·</span>
-                              <button className="hover:text-accent-300 transition-colors">▶ Jump to</button>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); pending.toggleDelete(i, wi); setSelectedWord(null) }}
+                                className="hover:text-red-300 transition-colors"
+                              >
+                                {deleted ? '↺ Undo' : '🗑️ Delete'}
+                              </button>
                             </span>
                           )}
                         </span>
@@ -729,7 +1113,15 @@ export default function Editor() {
 
             {/* Footer */}
             <div className="px-5 py-2.5 border-t border-gray-100 flex-shrink-0">
-              <p className="text-xs text-gray-400">847 words · ~5 min speaking time</p>
+              <p className="text-xs text-gray-400">
+                {transcriptState === 'ready'
+                  ? `${wordCount} words · ${fmtMMSS(transcript?.duration || player.duration)} runtime`
+                  : transcriptState === 'transcribing'
+                  ? 'Generating transcript…'
+                  : transcriptState === 'no-audio'
+                  ? 'No audio yet'
+                  : '—'}
+              </p>
             </div>
           </div>
         </div>
