@@ -1,4 +1,4 @@
-import { createContext, useContext } from 'react'
+import { createContext, useContext, useState, useEffect } from 'react'
 import {
   ClerkProvider,
   useUser,
@@ -119,17 +119,32 @@ function ClerkAuthBridge({ children }) {
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 
+const DEV_USER = { id: 'dev', email: 'dev@local', user_metadata: { name: 'Dev User' } }
+const DEV_AUTH_KEY = 'sonicly_dev_signed_in'
+
 function DevAuthProvider({ children }) {
+  const [isAuthenticated, setIsAuthenticated] = useState(() => {
+    if (typeof window === 'undefined') return true
+    const stored = window.localStorage.getItem(DEV_AUTH_KEY)
+    // Default to signed-in so first-run dev still lands in the app.
+    return stored === null ? true : stored === '1'
+  })
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(DEV_AUTH_KEY, isAuthenticated ? '1' : '0')
+  }, [isAuthenticated])
+
   const value = {
-    user: { id: 'dev', email: 'dev@local', user_metadata: { name: 'Dev User' } },
-    session: { user: { id: 'dev', email: 'dev@local', user_metadata: { name: 'Dev User' } } },
+    user: isAuthenticated ? DEV_USER : null,
+    session: isAuthenticated ? { user: DEV_USER } : null,
     loading: false,
     authReady: true,
-    isAuthenticated: true,
-    signInWithProvider: async () => ({ error: null }),
-    signUp: async () => ({ error: null }),
-    signIn: async () => ({ error: null }),
-    signOut: async () => {},
+    isAuthenticated,
+    signInWithProvider: async () => { setIsAuthenticated(true); return { error: null } },
+    signUp: async () => { setIsAuthenticated(true); return { error: null } },
+    signIn: async () => { setIsAuthenticated(true); return { error: null } },
+    signOut: async () => { setIsAuthenticated(false) },
     getToken: async () => null,
   }
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
