@@ -100,6 +100,19 @@ export async function listVersions({ id, getToken } = {}) {
   return handleJson(res)
 }
 
+export async function exportProject({ id, format, versionId, filename, getToken } = {}) {
+  const res = await fetch(`${API_URL}/projects/${id}/export`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(await authHeaders(getToken)) },
+    body: JSON.stringify({
+      format,
+      version_id: versionId ?? null,
+      filename: filename ?? null,
+    }),
+  })
+  return handleJson(res)
+}
+
 export async function activateVersion({ id, versionId, getToken } = {}) {
   const res = await fetch(`${API_URL}/projects/${id}/versions/${versionId}/activate`, {
     method: 'POST',

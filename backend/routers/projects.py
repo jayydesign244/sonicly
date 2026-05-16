@@ -2,6 +2,7 @@ import copy
 import io
 import os
 import json
+import re
 import tempfile
 import httpx
 from fastapi import APIRouter, HTTPException, UploadFile, File, Depends
@@ -16,6 +17,7 @@ from models.schemas import (
     ProjectOut,
     ChatRequest,
     ExportRequest,
+    ExportResult,
     ProcessingStatus,
     ApplyEditsRequest,
     AudioVersionOut,
@@ -315,7 +317,7 @@ async def processing_status(
     )
 
 
-@router.post("/{project_id}/export")
+@router.post("/{project_id}/export", response_model=ExportResult)
 async def export_project(
     project_id: int,
     payload: ExportRequest,
@@ -323,14 +325,70 @@ async def export_project(
     db: AsyncSession = Depends(get_db),
 ):
     project = await _get_owned_project(db, project_id, user)
+
+    fmt = (payload.format or "mp3").lower()
+    if fmt not in audio_editor.FORMAT_SPECS:
+        raise HTTPException(status_code=400, detail=f"Unsupported format: {fmt}")
+    if not audio_editor.ffmpeg_available():
+        raise HTTPException(status_code=503, detail="FFmpeg not available on server")
+
+    # Resolve source — explicit version_id wins, else the project's active audio.
+    source_url: Optional[str] = project.audio_url
+    chosen_version_id: Optional[int] = None
+    if payload.version_id is not None:
+        result = await db.execute(
+            select(AudioVersion).where(
+                AudioVersion.id == payload.version_id,
+                AudioVersion.project_id == project_id,
+            )
+        )
+        version = result.scalar_one_or_none()
+        if not version:
+            raise HTTPException(status_code=404, detail="Version not found")
+        source_url = version.audio_url
+        chosen_version_id = version.id
+    else:
+        chosen_version_id = project.active_version_id
+
+    if not source_url:
+        raise HTTPException(status_code=400, detail="Project has no audio to export")
+
+    # Sanitize filename — strip any extension the user typed, replace bad chars.
+    raw_name = (payload.filename or project.name or "audio").strip()
+    base_name = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", raw_name)
+    base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", base_name).strip("_") or "audio"
+
+    spec = audio_editor.FORMAT_SPECS[fmt]
+    out_filename = f"{base_name}.{spec['ext']}"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src_path = os.path.join(tmp, "source.bin")
+        out_path = os.path.join(tmp, out_filename)
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.get(source_url)
+            r.raise_for_status()
+            with open(src_path, "wb") as f:
+                f.write(r.content)
+        await audio_editor.transcode(src_path, out_path, fmt)
+        with open(out_path, "rb") as f:
+            data = f.read()
+        download_url = await storage_upload(
+            _user_id(user),
+            out_filename,
+            data,
+            content_type=spec["content_type"],
+        )
+
     project.status = "Exported"
     await db.commit()
-    return {
-        "message": "Export ready",
-        "filename": f"{payload.filename}.{payload.format}",
-        "size_mb": 8.4,
-        "download_url": f"/downloads/{payload.filename}.{payload.format}",
-    }
+
+    return ExportResult(
+        download_url=download_url,
+        filename=out_filename,
+        size_bytes=len(data),
+        format=fmt,
+        version_id=chosen_version_id,
+    )
 
 
 # ─── Transcript-driven editing ────────────────────────────────────────

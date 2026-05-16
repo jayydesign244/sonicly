@@ -8,6 +8,33 @@ from typing import List, Optional, Sequence, Tuple
 
 CROSSFADE_SECONDS = 0.04  # 40ms — masks splice clicks without bleeding words
 
+# Export format specs. Lossless WAV uses 24-bit PCM at 48kHz so further editing
+# in a DAW doesn't lose headroom; MP3/M4A use bitrates high enough that even
+# trained ears can't ABX them against the source.
+FORMAT_SPECS = {
+    "mp3": {
+        "codec": "libmp3lame",
+        "bitrate": "320k",
+        "extra": [],
+        "ext": "mp3",
+        "content_type": "audio/mpeg",
+    },
+    "wav": {
+        "codec": "pcm_s24le",
+        "bitrate": None,
+        "extra": ["-ar", "48000"],
+        "ext": "wav",
+        "content_type": "audio/wav",
+    },
+    "m4a": {
+        "codec": "aac",
+        "bitrate": "256k",
+        "extra": [],
+        "ext": "m4a",
+        "content_type": "audio/mp4",
+    },
+}
+
 _cached_ffmpeg: Optional[str] = None
 
 
@@ -189,6 +216,20 @@ async def render_with_ops(
         "-c:a", "libmp3lame", "-b:a", "192k",
         out_path,
     ])
+    await _run(cmd)
+
+
+async def transcode(source_path: str, out_path: str, fmt: str) -> None:
+    """Re-encode `source_path` to the requested export format. No filter graph,
+    no edits — just a straight codec swap so we don't degrade quality."""
+    spec = FORMAT_SPECS.get(fmt)
+    if not spec:
+        raise ValueError(f"Unsupported export format: {fmt}")
+    cmd = [_ff(), "-y", "-i", source_path, "-vn", "-c:a", spec["codec"]]
+    if spec["bitrate"]:
+        cmd.extend(["-b:a", spec["bitrate"]])
+    cmd.extend(spec["extra"])
+    cmd.append(out_path)
     await _run(cmd)
 
 
