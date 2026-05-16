@@ -165,12 +165,56 @@ async def upload_audio(
     return ProjectOut.model_validate(project)
 
 
-def _filename_from_url(url: str) -> str:
-    name = url.rsplit("/", 1)[-1].split("?", 1)[0] or "audio.bin"
-    # Whisper picks the decoder from the extension — guarantee one it accepts.
-    if "." not in name:
-        name += ".mp3"
-    return name
+_CT_TO_EXT = {
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/wave": "wav",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/aac": "aac",
+    "audio/ogg": "ogg",
+    "audio/webm": "webm",
+    "audio/flac": "flac",
+    "audio/x-flac": "flac",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+}
+
+# Whisper's accepted set, per OpenAI docs.
+_WHISPER_EXTS = {"mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "flac", "ogg"}
+
+
+def _ext_from_content_type(content_type: Optional[str]) -> Optional[str]:
+    if not content_type:
+        return None
+    base = content_type.split(";", 1)[0].strip().lower()
+    return _CT_TO_EXT.get(base)
+
+
+def _filename_from_url(url: str, content_type: Optional[str] = None) -> str:
+    """Build a filename Whisper can decode.
+
+    Strategy: take the basename from the URL; if its extension isn't in
+    Whisper's accepted set, override it using the response's Content-Type
+    (e.g. audio/webm → .webm). Only fall back to .mp3 when neither the
+    URL nor the content type tells us anything useful — that path is the
+    risky one, so we want to avoid it whenever possible.
+    """
+    name = url.rsplit("/", 1)[-1].split("?", 1)[0] or "audio"
+    stem, dot, ext = name.rpartition(".")
+    ext = ext.lower() if dot else ""
+
+    if ext in _WHISPER_EXTS:
+        return name
+
+    ct_ext = _ext_from_content_type(content_type)
+    if ct_ext and ct_ext in _WHISPER_EXTS:
+        base = stem if dot else name
+        return f"{base}.{ct_ext}"
+
+    return f"{stem if dot else name}.mp3"
 
 
 def _build_transcript(whisper_response: dict) -> dict:
@@ -243,10 +287,11 @@ async def transcribe_project(
             resp = await client.get(project.audio_url)
             resp.raise_for_status()
             audio_bytes = resp.content
+            content_type = resp.headers.get("content-type")
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Could not fetch audio: {exc}")
 
-    filename = _filename_from_url(project.audio_url)
+    filename = _filename_from_url(project.audio_url, content_type)
     audio_buf = io.BytesIO(audio_bytes)
     audio_buf.name = filename
 
@@ -308,12 +353,26 @@ async def processing_status(
     user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _get_owned_project(db, project_id, user)
+    """Derive processing state from the project's current fields so the
+    Processing screen reflects reality rather than a hardcoded mock."""
+    project = await _get_owned_project(db, project_id, user)
+
+    if not project.audio_url:
+        step, progress, complete = "uploading", 0.1, False
+    elif not project.transcript:
+        step, progress, complete = "transcribing", 0.55, False
+    else:
+        segments = (project.transcript or {}).get("segments") or []
+        if not segments:
+            step, progress, complete = "scanning", 0.85, False
+        else:
+            step, progress, complete = "ready", 1.0, True
+
     return ProcessingStatus(
         project_id=project_id,
-        step="transcribing",
-        progress=0.75,
-        complete=False,
+        step=step,
+        progress=progress,
+        complete=complete,
     )
 
 

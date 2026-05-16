@@ -12,10 +12,16 @@ can fall back to ELEVENLABS_FALLBACK_VOICE_ID (a premade voice that's
 available on every plan). That keeps the replace flow demoable without
 forcing a paid plan; the version label makes it obvious it's not the
 user's real voice.
+
+Requests are wrapped in an exponential-backoff retry on 429 and 5xx so a
+single rate-limit blip during a multi-word replace doesn't fail the
+whole apply.
 """
+import asyncio
 import json
 import os
-from typing import Optional
+import random
+from typing import Awaitable, Callable, Optional
 
 import httpx
 
@@ -51,6 +57,54 @@ class VoiceError(RuntimeError):
         self.status_code = status_code
 
 
+_MAX_RETRIES = int(os.environ.get("ELEVENLABS_MAX_RETRIES", "3"))
+_BASE_BACKOFF = float(os.environ.get("ELEVENLABS_BASE_BACKOFF", "0.75"))
+_RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+async def _request_with_retry(
+    send: Callable[[httpx.AsyncClient], Awaitable[httpx.Response]],
+    *,
+    timeout: float,
+) -> httpx.Response:
+    """Call `send(client)` with exponential backoff on transient errors.
+
+    Retries on 429/5xx (honouring Retry-After when present) and on
+    network errors. Non-retryable 4xx responses are returned as-is for
+    the caller to translate via `_parse_error`.
+    """
+    last_exc: Optional[Exception] = None
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                resp = await send(client)
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                resp = None
+            else:
+                if resp.status_code not in _RETRY_STATUS:
+                    return resp
+                last_exc = None
+
+            if attempt == _MAX_RETRIES:
+                if resp is not None:
+                    return resp
+                raise VoiceError(f"Network error talking to ElevenLabs: {last_exc}")
+
+            delay = _BASE_BACKOFF * (2 ** attempt)
+            if resp is not None:
+                retry_after = resp.headers.get("retry-after")
+                if retry_after:
+                    try:
+                        delay = max(delay, float(retry_after))
+                    except ValueError:
+                        pass
+            delay += random.uniform(0, _BASE_BACKOFF)
+            await asyncio.sleep(delay)
+
+    raise VoiceError("Unreachable retry loop exit")
+
+
 def _parse_error(resp: httpx.Response) -> VoiceError:
     """Build a VoiceError that carries the upgrade-required flag when the
     API returns paid_plan_required (free-tier limitation for IVC)."""
@@ -81,18 +135,20 @@ async def clone_voice(audio_bytes: bytes, name: str, content_type: str = "audio/
     if not is_configured():
         raise VoiceError("ELEVENLABS_API_KEY not configured")
 
-    files = {"files": (f"{name}.mp3", audio_bytes, content_type)}
     data = {
         "name": name[:100] or "Sonicly voice",
         "description": "Cloned by Sonicly for transcript-based edits",
     }
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
+
+    async def _send(client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
             f"{ELEVENLABS_BASE}/voices/add",
             headers=_headers(),
             data=data,
-            files=files,
+            files={"files": (f"{name}.mp3", audio_bytes, content_type)},
         )
+
+    resp = await _request_with_retry(_send, timeout=120.0)
     if resp.status_code >= 400:
         raise _parse_error(resp)
     body = resp.json()
@@ -129,12 +185,14 @@ async def synthesize(
             "use_speaker_boost": True,
         },
     }
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
+    async def _send(client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
             f"{ELEVENLABS_BASE}/text-to-speech/{voice_id}",
             headers=_headers({"Content-Type": "application/json", "Accept": "audio/mpeg"}),
             json=payload,
         )
+
+    resp = await _request_with_retry(_send, timeout=120.0)
     if resp.status_code >= 400:
         raise _parse_error(resp)
     return resp.content

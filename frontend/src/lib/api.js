@@ -56,6 +56,13 @@ export async function getProject({ id, getToken } = {}) {
   return handleJson(res)
 }
 
+export async function getProcessingStatus({ id, getToken } = {}) {
+  const res = await fetch(`${API_URL}/projects/${id}/processing`, {
+    headers: { ...(await authHeaders(getToken)) },
+  })
+  return handleJson(res)
+}
+
 export async function transcribeAudio({ id, getToken } = {}) {
   const res = await fetch(`${API_URL}/projects/${id}/transcribe`, {
     method: 'POST',
