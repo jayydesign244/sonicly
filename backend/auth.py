@@ -4,14 +4,32 @@ import asyncio
 from typing import Optional
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 
-CLERK_ISSUER = os.environ.get("CLERK_ISSUER", "").rstrip("/")
+# Re-read .env on every (re)import so dev users who blank out CLERK_ISSUER
+# pick it up under uvicorn --reload without a full process restart.
+load_dotenv(override=True)
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    # The .env.example ships a literal placeholder URL — if anyone forgets to
+    # clear it, treat it as unset so the dev fallback still kicks in.
+    return "YOUR-FRONTEND-API" in value or "YOUR_FRONTEND_API" in value
+
+
+_raw_issuer = os.environ.get("CLERK_ISSUER", "").strip().rstrip("/")
+CLERK_ISSUER = "" if _looks_like_placeholder(_raw_issuer) else _raw_issuer
+_raw_jwks = (os.environ.get("CLERK_JWKS_URL") or "").strip()
 CLERK_JWKS_URL = (
-    os.environ.get("CLERK_JWKS_URL")
-    or (f"{CLERK_ISSUER}/.well-known/jwks.json" if CLERK_ISSUER else "")
+    ""
+    if _looks_like_placeholder(_raw_jwks)
+    else (
+        _raw_jwks
+        or (f"{CLERK_ISSUER}/.well-known/jwks.json" if CLERK_ISSUER else "")
+    )
 )
 
 security = HTTPBearer(auto_error=False)
