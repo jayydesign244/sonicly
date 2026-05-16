@@ -141,7 +141,14 @@ class ProcessingStatus(BaseModel):
 
 
 class ExportRequest(BaseModel):
-    project_id: int
-    format: str
-    version: str
+    format: str = "mp3"  # mp3 | wav | m4a
+    version_id: Optional[int] = None  # default: project's active version
+    filename: Optional[str] = None  # without extension; we append the right one
+
+
+class ExportResult(BaseModel):
+    download_url: str
     filename: str
+    size_bytes: int
+    format: str
+    version_id: Optional[int] = None

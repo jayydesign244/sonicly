@@ -11,6 +11,7 @@ import {
   listVersions,
   activateVersion,
   cloneVoice,
+  exportProject,
 } from '../lib/api'
 import { useAudioPlayer, formatTime } from '../hooks/useAudioPlayer'
 import { usePendingEdits } from '../hooks/usePendingEdits'
@@ -32,13 +33,103 @@ const QUICK_CHIPS = [
 ]
 
 /* ─── Export Modal ────────────────────────────────────────────── */
-function ExportModal({ onClose }) {
-  const [format, setFormat] = useState('mp3')
-  const [filename, setFilename] = useState('podcast_ep12_enhanced')
-  const [version, setVersion] = useState('warmth')
-  const [downloaded, setDownloaded] = useState(false)
+const FORMAT_OPTIONS = [
+  { id: 'mp3', label: 'MP3', sub: '320kbps · best for sharing', bps: 320_000 },
+  { id: 'wav', label: 'WAV', sub: '24-bit lossless · best for editing', bps: 24 * 48_000 * 2 },
+  { id: 'm4a', label: 'M4A', sub: '256kbps AAC · Apple / Podcasts', bps: 256_000 },
+]
 
-  const handleDownload = () => setDownloaded(true)
+function formatBytes(bytes) {
+  if (!bytes || bytes <= 0) return '—'
+  if (bytes >= 1_000_000_000) return `${(bytes / 1_000_000_000).toFixed(2)} GB`
+  if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`
+  if (bytes >= 1_000) return `${(bytes / 1_000).toFixed(0)} KB`
+  return `${bytes} B`
+}
+
+function ExportModal({
+  onClose,
+  projectId,
+  projectName,
+  versions = [],
+  activeVersionId = null,
+  durationSec = 0,
+  exportHistory = [],
+  onExported,
+  getToken,
+}) {
+  // Sort: active first, then newest → oldest by id.
+  const versionOptions = useMemo(() => {
+    const sorted = [...versions].sort((a, b) => b.id - a.id)
+    if (activeVersionId) {
+      const idx = sorted.findIndex(v => v.id === activeVersionId)
+      if (idx > 0) {
+        const [active] = sorted.splice(idx, 1)
+        sorted.unshift(active)
+      }
+    }
+    return sorted
+  }, [versions, activeVersionId])
+
+  const defaultBase = useMemo(() => {
+    const raw = projectName || 'audio'
+    return raw.replace(/\.[a-z0-9]{1,5}$/i, '')
+  }, [projectName])
+
+  const [format, setFormat] = useState('mp3')
+  const [filename, setFilename] = useState(`${defaultBase}_enhanced`)
+  const [versionId, setVersionId] = useState(activeVersionId ?? '')
+  const [status, setStatus] = useState('idle') // idle | exporting | done | error
+  const [error, setError] = useState(null)
+  const [result, setResult] = useState(null)
+
+  const estimatedBytes = useMemo(() => {
+    const bps = FORMAT_OPTIONS.find(f => f.id === format)?.bps || 0
+    return Math.round((bps * (durationSec || 0)) / 8)
+  }, [format, durationSec])
+
+  const handleDownload = async () => {
+    if (!projectId || status === 'exporting') return
+    setStatus('exporting')
+    setError(null)
+    try {
+      const res = await exportProject({
+        id: projectId,
+        format,
+        versionId: versionId ? Number(versionId) : null,
+        filename,
+        getToken,
+      })
+      // Pull the rendered file as a blob so we can force a clean filename,
+      // regardless of the storage backend's URL shape.
+      const blob = await fetch(res.download_url).then(r => {
+        if (!r.ok) throw new Error(`Download failed (${r.status})`)
+        return r.blob()
+      })
+      const objUrl = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = objUrl
+      a.download = res.filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(objUrl)
+
+      const record = { ...res, exported_at: new Date().toISOString() }
+      setResult(record)
+      setStatus('done')
+      onExported?.(record)
+    } catch (err) {
+      setError(err.message || 'Export failed')
+      setStatus('error')
+    }
+  }
+
+  const versionLabel = (v) => {
+    const isActive = v.id === activeVersionId
+    const dur = v.duration ? ` · ${fmtMMSS(v.duration)}` : ''
+    return `${v.label || 'Edit'}${dur}${isActive ? ' ✓' : ''}`
+  }
 
   return (
     <ModalOverlay onClose={onClose}>
@@ -49,7 +140,7 @@ function ExportModal({ onClose }) {
         </div>
         <div className="border-t border-gray-100 mb-5" />
 
-        {downloaded ? (
+        {status === 'done' && result ? (
           <div className="py-8 flex flex-col items-center text-center">
             <div className="w-12 h-12 bg-emerald-50 rounded-full flex items-center justify-center mb-3">
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none" className="text-emerald-500">
@@ -57,34 +148,43 @@ function ExportModal({ onClose }) {
               </svg>
             </div>
             <p className="text-sm font-semibold text-gray-900 mb-1">Your file is ready!</p>
-            <p className="text-xs text-gray-400 mb-5">{filename}.{format} · 8.4 MB</p>
-            <button onClick={onClose} className="btn-ghost text-sm">Back to editor</button>
+            <p className="text-xs text-gray-400 mb-5">
+              {result.filename} · {formatBytes(result.size_bytes)}
+            </p>
+            <div className="flex gap-2">
+              <button onClick={() => { setStatus('idle'); setResult(null) }} className="btn-ghost text-sm">
+                Export another
+              </button>
+              <button onClick={onClose} className="btn-primary text-sm">Back to editor</button>
+            </div>
           </div>
         ) : (
           <div className="space-y-5">
             {/* Version */}
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-2">Version to export</label>
-              <select
-                value={version}
-                onChange={e => setVersion(e.target.value)}
-                className="input-field text-sm"
-              >
-                <option value="warmth">After voice warmth (latest) ✓</option>
-                <option value="noise">After noise removal</option>
-                <option value="original">Original</option>
-              </select>
+              {versionOptions.length === 0 ? (
+                <p className="text-xs text-gray-400 px-1">
+                  No saved versions yet — original audio will be exported.
+                </p>
+              ) : (
+                <select
+                  value={versionId}
+                  onChange={e => setVersionId(e.target.value)}
+                  className="input-field text-sm"
+                >
+                  {versionOptions.map(v => (
+                    <option key={v.id} value={v.id}>{versionLabel(v)}</option>
+                  ))}
+                </select>
+              )}
             </div>
 
             {/* Format */}
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-2">File format</label>
               <div className="grid grid-cols-3 gap-2">
-                {[
-                  { id: 'mp3', label: 'MP3', sub: 'Best for sharing' },
-                  { id: 'wav', label: 'WAV', sub: 'Lossless' },
-                  { id: 'm4a', label: 'M4A', sub: 'Apple / Podcasts' },
-                ].map(f => (
+                {FORMAT_OPTIONS.map(f => (
                   <button
                     key={f.id}
                     onClick={() => setFormat(f.id)}
@@ -106,34 +206,66 @@ function ExportModal({ onClose }) {
             {/* Filename */}
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-2">Filename</label>
-              <input
-                type="text"
-                value={filename}
-                onChange={e => setFilename(e.target.value)}
-                className="input-field text-sm"
-              />
+              <div className="flex items-stretch gap-2">
+                <input
+                  type="text"
+                  value={filename}
+                  onChange={e => setFilename(e.target.value)}
+                  className="input-field text-sm flex-1"
+                />
+                <span className="px-3 flex items-center text-xs text-gray-400 bg-gray-50 border border-gray-200 rounded-lg">
+                  .{format}
+                </span>
+              </div>
             </div>
 
             {/* File size */}
             <div className="flex items-center justify-between text-xs text-gray-400">
-              <span>Estimated size: 8.4 MB</span>
+              <span>Estimated size: {formatBytes(estimatedBytes)}</span>
+              {durationSec > 0 && <span>{fmtMMSS(durationSec)} duration</span>}
             </div>
 
-            {/* Summary */}
-            <div className="bg-gray-50 rounded-lg px-3 py-2.5 border border-gray-100">
-              <p className="text-xs text-gray-500">
-                ✓ Background noise removed · ✓ Reverb reduced · ✓ 34 fillers cut
-              </p>
-            </div>
+            {error && (
+              <div className="text-xs text-red-500 bg-red-50 border border-red-100 rounded-lg px-3 py-2">
+                {error}
+              </div>
+            )}
 
             {/* Download */}
             <button
               onClick={handleDownload}
-              className="btn-primary w-full py-3 text-sm"
+              disabled={status === 'exporting' || !filename.trim()}
+              className="btn-primary w-full py-3 text-sm disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2"
             >
-              Download
+              {status === 'exporting' ? (
+                <>
+                  <svg className="animate-spin" width="14" height="14" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25" />
+                    <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                  </svg>
+                  Rendering…
+                </>
+              ) : 'Download'}
             </button>
             <p className="text-xs text-gray-400 text-center -mt-2">✓ No watermarks. Ever.</p>
+
+            {/* Export history (this session) */}
+            {exportHistory.length > 0 && (
+              <div className="border-t border-gray-100 pt-4">
+                <p className="text-xs font-medium text-gray-500 mb-2">Exported this session</p>
+                <ul className="space-y-1.5 max-h-32 overflow-y-auto">
+                  {exportHistory.map((h, i) => (
+                    <li
+                      key={`${h.filename}-${h.exported_at}-${i}`}
+                      className="flex items-center justify-between text-xs text-gray-600 px-2 py-1.5 rounded hover:bg-gray-50"
+                    >
+                      <span className="truncate">{h.filename}</span>
+                      <span className="text-gray-400 flex-shrink-0 ml-2">{formatBytes(h.size_bytes)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -296,6 +428,7 @@ export default function Editor() {
 
   const [showExport, setShowExport] = useState(false)
   const [showCompare, setShowCompare] = useState(false)
+  const [exportHistory, setExportHistory] = useState([])
   const [showDiagnosis, setShowDiagnosis] = useState(true)
   const [messages, setMessages] = useState(INITIAL_MESSAGES)
   const [inputText, setInputText] = useState('')
@@ -1128,7 +1261,19 @@ export default function Editor() {
       </div>
 
       {/* Modals */}
-      {showExport && <ExportModal onClose={() => setShowExport(false)} />}
+      {showExport && (
+        <ExportModal
+          onClose={() => setShowExport(false)}
+          projectId={project.id}
+          projectName={projectName}
+          versions={versions}
+          activeVersionId={activeVersionId}
+          durationSec={player.duration || transcript?.duration || 0}
+          exportHistory={exportHistory}
+          onExported={(record) => setExportHistory(prev => [record, ...prev])}
+          getToken={getToken}
+        />
+      )}
       {showCompare && (
         <CompareModal
           onClose={() => setShowCompare(false)}
