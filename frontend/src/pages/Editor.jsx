@@ -25,6 +25,26 @@ const fmtMMSS = (s) => {
   return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`
 }
 
+const extToLabel = {
+  mp3: 'MP3', wav: 'WAV', m4a: 'M4A', aac: 'AAC', flac: 'FLAC',
+  ogg: 'OGG', opus: 'OPUS', webm: 'WebM', mp4: 'MP4',
+}
+
+const formatFromUrl = (url) => {
+  if (!url) return null
+  const clean = url.split('?')[0].split('#')[0]
+  const ext = clean.includes('.') ? clean.split('.').pop().toLowerCase() : ''
+  return extToLabel[ext] || (ext ? ext.toUpperCase() : null)
+}
+
+const formatBytesShort = (bytes) => {
+  if (!Number.isFinite(bytes) || bytes <= 0) return null
+  if (bytes >= 1_000_000_000) return `${(bytes / 1_000_000_000).toFixed(2)} GB`
+  if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`
+  if (bytes >= 1_000) return `${Math.round(bytes / 1_000)} KB`
+  return `${bytes} B`
+}
+
 const QUICK_CHIPS = [
   { icon: '🎙️', label: 'Clean up audio' },
   { icon: '✂️', label: 'Remove filler words' },
@@ -452,6 +472,7 @@ export default function Editor() {
   const [voiceId, setVoiceId] = useState(project.voice_id || null)
   const [voiceCloning, setVoiceCloning] = useState(false)
   const [inlineEdit, setInlineEdit] = useState(null) // { si, wi, text }
+  const [audioSizeBytes, setAudioSizeBytes] = useState(null)
   const pending = usePendingEdits()
   const chatEndRef = useRef(null)
   const activeWordRef = useRef(null)
@@ -660,6 +681,79 @@ export default function Editor() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  // Best-effort size lookup for the file-info line. HEAD avoids downloading
+  // the bytes; some CDNs don't expose Content-Length so we tolerate failure.
+  useEffect(() => {
+    let cancelled = false
+    setAudioSizeBytes(null)
+    if (!audioUrl) return
+    fetch(audioUrl, { method: 'HEAD' })
+      .then(r => {
+        if (cancelled || !r.ok) return
+        const len = r.headers.get('Content-Length')
+        if (len) setAudioSizeBytes(parseInt(len, 10))
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [audioUrl])
+
+  const fileInfo = useMemo(() => {
+    const parts = []
+    const dur = transcript?.duration || player.duration
+    if (Number.isFinite(dur) && dur > 0) parts.push(fmtMMSS(dur))
+    const fmt = formatFromUrl(audioUrl)
+    if (fmt) parts.push(fmt)
+    const size = formatBytesShort(audioSizeBytes)
+    if (size) parts.push(size)
+    return parts.join(' · ')
+  }, [audioUrl, audioSizeBytes, player.duration, transcript?.duration])
+
+  const diagnosisItems = useMemo(() => {
+    const items = []
+    if (transcriptState === 'ready' && fillerRefs.length > 0) {
+      items.push({
+        kind: 'fillers',
+        severity: fillerRefs.length > 20 ? 'high' : 'medium',
+        text: `${fillerRefs.length} filler word${fillerRefs.length === 1 ? '' : 's'} detected`,
+      })
+    }
+    return items
+  }, [transcriptState, fillerRefs.length])
+
+  const summaryChips = useMemo(() => {
+    const chips = []
+    const activeVersion = versions.find(v => v.id === activeVersionId)
+    if (activeVersion) {
+      chips.push({ tone: 'good', text: `✓ ${activeVersion.label}` })
+    } else if (audioUrl && versions.length === 0) {
+      chips.push({ tone: 'muted', text: 'Original audio · no edits yet' })
+    } else if (audioUrl && activeVersionId == null) {
+      chips.push({ tone: 'muted', text: '↺ Original audio' })
+    }
+    if (versions.length > 0) {
+      chips.push({
+        tone: 'muted',
+        text: `${versions.length} version${versions.length === 1 ? '' : 's'}`,
+      })
+    }
+    if (fillerRefs.length > 0) {
+      chips.push({
+        tone: 'warn',
+        text: `✂︎ ${fillerRefs.length} filler${fillerRefs.length === 1 ? '' : 's'} detected`,
+      })
+    }
+    if (pending.count > 0) {
+      chips.push({
+        tone: 'pending',
+        text: `● ${pending.count} pending change${pending.count === 1 ? '' : 's'}`,
+      })
+    }
+    if (transcript?.language) {
+      chips.push({ tone: 'muted', text: transcript.language.toUpperCase() })
+    }
+    return chips
+  }, [versions, activeVersionId, audioUrl, fillerRefs.length, pending.count, transcript?.language])
+
   const sendToAI = async (userText) => {
     const history = [...messages, { role: 'user', text: userText }]
     setMessages([...history, { role: 'ai', text: '' }])
@@ -697,9 +791,14 @@ export default function Editor() {
   }
 
   const handleFixAll = () => {
-    if (isStreaming) return
-    setShowDiagnosis(false)
-    sendToAI('Fix all three issues: background noise, room reverb, and filler words.')
+    let acted = false
+    for (const item of diagnosisItems) {
+      if (item.kind === 'fillers') {
+        handleRemoveAllFillers()
+        acted = true
+      }
+    }
+    if (acted) setShowDiagnosis(false)
   }
 
   return (
@@ -742,7 +841,9 @@ export default function Editor() {
 
         {/* Right */}
         <div className="flex items-center gap-2 flex-shrink-0">
-          <span className="text-xs text-gray-400 hidden md:block">3:42 · MP3 · 8.4MB</span>
+          {fileInfo && (
+            <span className="text-xs text-gray-400 hidden md:block">{fileInfo}</span>
+          )}
           <button
             onClick={() => setShowCompare(true)}
             className="btn-ghost text-xs flex items-center gap-1.5 py-1.5"
@@ -778,32 +879,38 @@ export default function Editor() {
 
           {/* Chat content */}
           <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4 min-h-0">
-            {/* Diagnosis card */}
-            {showDiagnosis && (
+            {/* Diagnosis card — only shows when we actually detected something */}
+            {showDiagnosis && diagnosisItems.length > 0 && (
               <div className="border border-accent-200 bg-accent-50/50 rounded-xl p-3.5 animate-fade-in">
                 <div className="flex items-start gap-2 mb-2.5">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" className="text-accent-500 mt-0.5 flex-shrink-0">
                     <path d="M12 2L13.09 8.26L20 9L13.09 9.74L12 16L10.91 9.74L4 9L10.91 8.26L12 2Z" fill="currentColor" />
                   </svg>
-                  <p className="text-xs font-medium text-gray-800">I found 3 things in your audio</p>
+                  <p className="text-xs font-medium text-gray-800">
+                    {diagnosisItems.length === 1
+                      ? 'I found 1 thing in your audio'
+                      : `I found ${diagnosisItems.length} things in your audio`}
+                  </p>
                 </div>
                 <ul className="space-y-1.5 mb-3">
-                  <li className="flex items-center gap-2 text-xs text-gray-600">
-                    <span className="w-2 h-2 bg-red-400 rounded-full flex-shrink-0" />
-                    Background noise — moderate throughout
-                  </li>
-                  <li className="flex items-center gap-2 text-xs text-gray-600">
-                    <span className="w-2 h-2 bg-yellow-400 rounded-full flex-shrink-0" />
-                    Room reverb — light echo on voice
-                  </li>
-                  <li className="flex items-center gap-2 text-xs text-gray-600">
-                    <span className="w-2 h-2 bg-yellow-400 rounded-full flex-shrink-0" />
-                    34 filler words detected
-                  </li>
+                  {diagnosisItems.map(item => {
+                    const dotClass =
+                      item.severity === 'high'
+                        ? 'bg-red-400'
+                        : item.severity === 'medium'
+                        ? 'bg-yellow-400'
+                        : 'bg-gray-300'
+                    return (
+                      <li key={item.kind} className="flex items-center gap-2 text-xs text-gray-600">
+                        <span className={`w-2 h-2 ${dotClass} rounded-full flex-shrink-0`} />
+                        {item.text}
+                      </li>
+                    )
+                  })}
                 </ul>
                 <div className="flex items-center gap-2">
                   <button onClick={handleFixAll} className="btn-primary text-xs py-1 px-2.5">
-                    Fix all three
+                    {diagnosisItems.length === 1 ? 'Fix it' : `Fix all ${diagnosisItems.length}`}
                   </button>
                   <button
                     onClick={() => setShowDiagnosis(false)}
@@ -910,13 +1017,28 @@ export default function Editor() {
             </div>
 
             {/* Summary chips */}
-            <div className="flex flex-wrap gap-1.5 mb-4">
-              {['✓ Removed 14dB noise', '✓ Reduced reverb 40%', '✓ Cut 34 filler words', '↑ Quality: 42 → 87'].map(chip => (
-                <span key={chip} className="text-xs text-gray-500 bg-gray-50 border border-gray-100 px-2.5 py-1 rounded-full">
-                  {chip}
-                </span>
-              ))}
-            </div>
+            {summaryChips.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 mb-4">
+                {summaryChips.map((chip, idx) => {
+                  const toneClass =
+                    chip.tone === 'good'
+                      ? 'text-emerald-700 bg-emerald-50 border-emerald-100'
+                      : chip.tone === 'warn'
+                      ? 'text-amber-700 bg-amber-50 border-amber-200'
+                      : chip.tone === 'pending'
+                      ? 'text-violet-700 bg-violet-50 border-violet-200'
+                      : 'text-gray-500 bg-gray-50 border-gray-100'
+                  return (
+                    <span
+                      key={`${chip.text}-${idx}`}
+                      className={`text-xs px-2.5 py-1 rounded-full border ${toneClass}`}
+                    >
+                      {chip.text}
+                    </span>
+                  )
+                })}
+              </div>
+            )}
 
             {/* Playback controls */}
             <div className="flex items-center justify-between">
