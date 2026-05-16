@@ -58,7 +58,11 @@ export default function SignUp() {
         <div className="card p-8 shadow-modal">
           {/* Logo */}
           <div className="flex justify-center mb-6">
-            <div className="flex items-center gap-2">
+            <button
+              onClick={() => navigate('/')}
+              className="flex items-center gap-2 hover:opacity-80 transition-opacity"
+              aria-label="Go to home"
+            >
               <div className="w-8 h-8 bg-accent-500 rounded-lg flex items-center justify-center">
                 <svg width="16" height="16" viewBox="0 0 20 20" fill="white">
                   <rect x="1" y="8" width="2.5" height="4" rx="1.25" />
@@ -69,7 +73,7 @@ export default function SignUp() {
                 </svg>
               </div>
               <span className="font-semibold text-gray-900">Sonicly</span>
-            </div>
+            </button>
           </div>
 
           <h1 className="text-xl font-semibold text-gray-900 text-center mb-6">

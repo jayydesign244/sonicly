@@ -441,7 +441,11 @@ export default function Dashboard() {
       <aside className="w-[220px] flex-shrink-0 border-r border-gray-200 bg-white flex flex-col h-screen sticky top-0">
         {/* Logo */}
         <div className="h-14 px-4 flex items-center border-b border-gray-100">
-          <div className="flex items-center gap-2">
+          <button
+            onClick={() => navigate('/')}
+            className="flex items-center gap-2 hover:opacity-80 transition-opacity"
+            aria-label="Go to home"
+          >
             <div className="w-7 h-7 bg-accent-500 rounded-md flex items-center justify-center">
               <svg width="14" height="14" viewBox="0 0 20 20" fill="white">
                 <rect x="1" y="8" width="2.5" height="4" rx="1.25" />
@@ -452,7 +456,7 @@ export default function Dashboard() {
               </svg>
             </div>
             <span className="font-semibold text-gray-900 text-sm">Sonicly</span>
-          </div>
+          </button>
         </div>
 
         {/* Nav */}

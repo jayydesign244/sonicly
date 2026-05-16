@@ -52,7 +52,9 @@ export default function Landing() {
       {/* Nav */}
       <nav className="fixed top-0 left-0 right-0 z-50 border-b border-gray-100 bg-white/90 backdrop-blur-sm">
         <div className="max-w-6xl mx-auto px-6 h-14 flex items-center justify-between">
-          <Logo />
+          <button onClick={() => navigate('/')} className="hover:opacity-80 transition-opacity" aria-label="Go to home">
+            <Logo />
+          </button>
           <div className="flex items-center gap-3">
             {isAuthenticated ? (
               <>
