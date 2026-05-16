@@ -94,6 +94,14 @@ class ApplyEditsRequest(BaseModel):
     edits: List[dict]
 
 
+class ApplyOperationRequest(BaseModel):
+    """One-shot audio operation (FFmpeg primitive). See audio_editor.SUPPORTED_OPERATIONS."""
+    type: str
+    params: Optional[dict] = None
+    parent_version_id: Optional[int] = None
+    label: Optional[str] = None
+
+
 class FillersResponse(BaseModel):
     fillers: List[WordRef]
     total: int

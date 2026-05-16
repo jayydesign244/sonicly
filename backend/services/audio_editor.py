@@ -1,5 +1,6 @@
 """ffmpeg-backed audio editing: keep ranges, splice with a short crossfade."""
 import asyncio
+import math
 import os
 import re
 import shutil
@@ -234,6 +235,103 @@ async def transcode(source_path: str, out_path: str, fmt: str) -> None:
 
 
 _DUR_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)")
+
+
+async def apply_audio_filter(
+    source_path: str, out_path: str, audio_filter: str
+) -> None:
+    """Apply a single ffmpeg -af filter chain to source_path → out_path (mp3 192k)."""
+    cmd = [
+        _ff(), "-y", "-i", source_path,
+        "-af", audio_filter,
+        "-c:a", "libmp3lame", "-b:a", "192k",
+        out_path,
+    ]
+    await _run(cmd)
+
+
+# Supported one-shot operations. Each maps to an ffmpeg -af filter chain.
+# Operations that need params build the chain via build_operation_filter().
+SUPPORTED_OPERATIONS = {
+    "REMOVE_HUM",
+    "NORMALISE_LOUDNESS",
+    "TRIM_SILENCE",
+    "ADJUST_VOLUME",
+    "BALANCE_SPEAKERS",
+    "REMOVE_BREATHS",
+    "VOICE_DEEPER",
+    "VOICE_BRIGHTER",
+}
+
+
+def _pitch_filter(semitones: float) -> str:
+    """Pitch-shift filter chain. Positive = brighter, negative = deeper.
+
+    The asetrate+atempo trick only preserves duration when the asetrate
+    base matches the input sample rate, so we first resample to 44.1 kHz
+    and then apply the trick on that known baseline.
+    """
+    factor = 2 ** (semitones / 12.0)
+    return (
+        f"aresample=44100,"
+        f"asetrate=44100*{factor:.6f},"
+        f"aresample=44100,"
+        f"atempo={1.0 / factor:.6f}"
+    )
+
+
+def build_operation_filter(op_type: str, params: dict) -> Tuple[str, str]:
+    """Return (audio_filter, default_label) for a given operation.
+
+    Raises ValueError for unknown ops or invalid params.
+    """
+    p = params or {}
+    if op_type == "REMOVE_HUM":
+        return "highpass=f=80,lowpass=f=8000", "Removed hum"
+
+    if op_type == "NORMALISE_LOUDNESS":
+        target = float(p.get("target_lufs", -16))
+        if target not in (-16.0, -14.0):
+            raise ValueError("target_lufs must be -16 (podcast) or -14 (youtube)")
+        label = "Normalised loudness (podcast)" if target == -16.0 else "Normalised loudness (YouTube)"
+        return f"loudnorm=I={target:g}:LRA=11:TP=-1.5", label
+
+    if op_type == "TRIM_SILENCE":
+        return (
+            "silenceremove=start_periods=1:start_silence=0.5:start_threshold=-50dB:"
+            "stop_periods=1:stop_silence=0.5:stop_threshold=-50dB",
+            "Trimmed silence",
+        )
+
+    if op_type == "ADJUST_VOLUME":
+        direction = (p.get("direction") or "up").lower()
+        amount_db = float(p.get("amount_db", 3))
+        if amount_db <= 0:
+            raise ValueError("amount_db must be > 0")
+        if direction not in ("up", "down"):
+            raise ValueError("direction must be 'up' or 'down'")
+        sign = "+" if direction == "up" else "-"
+        return f"volume={sign}{amount_db:g}dB", f"Volume {direction} {amount_db:g}dB"
+
+    if op_type == "BALANCE_SPEAKERS":
+        return "dynaudnorm=p=0.9:s=5", "Balanced speaker levels"
+
+    if op_type == "REMOVE_BREATHS":
+        return "afftdn=nf=-25", "Removed breaths"
+
+    if op_type == "VOICE_DEEPER":
+        semitones = int(p.get("semitones", 2))
+        if not 1 <= semitones <= 4:
+            raise ValueError("semitones must be 1..4 for VOICE_DEEPER")
+        return _pitch_filter(-semitones), f"Voice deeper ({semitones} semitones)"
+
+    if op_type == "VOICE_BRIGHTER":
+        semitones = int(p.get("semitones", 2))
+        if not 1 <= semitones <= 3:
+            raise ValueError("semitones must be 1..3 for VOICE_BRIGHTER")
+        return _pitch_filter(semitones), f"Voice brighter ({semitones} semitones)"
+
+    raise ValueError(f"Unknown operation: {op_type}")
 
 
 async def probe_duration(path: str) -> float:

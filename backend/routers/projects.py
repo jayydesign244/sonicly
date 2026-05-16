@@ -20,6 +20,7 @@ from models.schemas import (
     ExportResult,
     ProcessingStatus,
     ApplyEditsRequest,
+    ApplyOperationRequest,
     AudioVersionOut,
     FillersResponse,
     WordRef,
@@ -822,6 +823,114 @@ async def apply_edits(
     project.transcript = new_transcript
     project.active_version_id = version.id
     flag_modified(project, "transcript")
+    await db.commit()
+    await db.refresh(version)
+    return AudioVersionOut.model_validate(version)
+
+
+@router.post("/{project_id}/operations/apply", response_model=AudioVersionOut)
+async def apply_operation(
+    project_id: int,
+    payload: ApplyOperationRequest,
+    user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Apply a one-shot FFmpeg audio operation (hum/loudness/silence/volume/etc).
+    Each call creates a new AudioVersion."""
+    project = await _get_owned_project(db, project_id, user)
+    if not project.audio_url:
+        raise HTTPException(status_code=400, detail="Project has no audio")
+    if not audio_editor.ffmpeg_available():
+        raise HTTPException(status_code=503, detail="ffmpeg not installed on the server")
+    if not storage_configured():
+        raise HTTPException(status_code=503, detail="Storage not configured")
+
+    op_type = (payload.type or "").upper()
+    if op_type not in audio_editor.SUPPORTED_OPERATIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported operation '{payload.type}'. Supported: {sorted(audio_editor.SUPPORTED_OPERATIONS)}",
+        )
+    try:
+        audio_filter, default_label = audio_editor.build_operation_filter(
+            op_type, payload.params or {}
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Pick source (parent version's URL if provided, else current).
+    source_url = project.audio_url
+    source_transcript = project.transcript
+    parent_id = payload.parent_version_id
+    if parent_id is not None:
+        result = await db.execute(
+            select(AudioVersion).where(
+                AudioVersion.id == parent_id,
+                AudioVersion.project_id == project_id,
+            )
+        )
+        parent = result.scalar_one_or_none()
+        if parent:
+            source_url = parent.audio_url
+            source_transcript = parent.transcript or source_transcript
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src_path = os.path.join(tmp, "in.mp3")
+        out_path = os.path.join(tmp, "out.mp3")
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.get(source_url)
+                resp.raise_for_status()
+                src_bytes = resp.content
+            with open(src_path, "wb") as f:
+                f.write(src_bytes)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Fetch source audio: {exc}")
+
+        try:
+            await audio_editor.apply_audio_filter(src_path, out_path, audio_filter)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        with open(out_path, "rb") as f:
+            rendered = f.read()
+        new_duration = await audio_editor.probe_duration(out_path)
+
+    try:
+        public_url = await storage_upload(
+            user_id=_user_id(user),
+            filename=f"op_{op_type.lower()}_{project_id}.mp3",
+            data=rendered,
+            content_type="audio/mpeg",
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Upload processed audio: {exc}")
+
+    # Transcript is unchanged by these filter operations — they don't cut time
+    # except TRIM_SILENCE (which removes head/tail silence). For TRIM_SILENCE
+    # the transcript word timings would technically shift, but the surgical
+    # fix-up is non-trivial; we keep the source transcript and update duration.
+    new_transcript = copy.deepcopy(source_transcript) if source_transcript else None
+    if new_transcript is not None:
+        new_transcript["duration"] = new_duration
+
+    version = AudioVersion(
+        project_id=project_id,
+        parent_id=parent_id,
+        label=payload.label or default_label,
+        audio_url=public_url,
+        transcript=new_transcript,
+        duration=new_duration,
+    )
+    db.add(version)
+    await db.flush()
+
+    project.audio_url = public_url
+    project.transcript = new_transcript
+    project.active_version_id = version.id
+    if new_transcript is not None:
+        flag_modified(project, "transcript")
     await db.commit()
     await db.refresh(version)
     return AudioVersionOut.model_validate(version)
