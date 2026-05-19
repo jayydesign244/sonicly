@@ -21,15 +21,16 @@ from models.schemas import (
     ProcessingStatus,
     ApplyEditsRequest,
     ApplyOperationRequest,
+    DeleteRangeRequest,
     AudioVersionOut,
     FillersResponse,
     WordRef,
 )
 from models.db import Project, AudioVersion
 from auth import get_current_user
-from database import get_db
+from database import get_db, SessionLocal
 from storage import upload_audio as storage_upload, is_configured as storage_configured
-from services import audio_editor, fillers as fillers_service, voice as voice_service
+from services import audio_editor, fillers as fillers_service, voice as voice_service, intent as intent_service
 from typing import List, Optional, Tuple
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -54,12 +55,29 @@ def _get_openai_client() -> AsyncOpenAI:
     return _openai_client
 
 SYSTEM_PROMPT = (
-    "You are Sonicly, an AI audio editing assistant inside a web app. "
-    "The user is editing an audio recording (podcast, interview, voiceover). "
-    "Help them with: noise reduction, removing filler words (um, uh, like), "
-    "leveling volume, trimming silence, EQ/warmth adjustments, de-essing, and reverb. "
-    "Be concise and conversational. When the user asks for an edit, confirm what "
-    "you've applied in 1-2 sentences. If the user is unclear, ask one short follow-up."
+    "You are Sonicly, an AI audio editor running inside a real web app. "
+    "You CAN edit audio — not just give advice. A separate intent parser "
+    "handles structured edit commands and executes them before you ever "
+    "see the message. The user sees the result reflected in the editor."
+    "\n\n"
+    "Capabilities the system already executes via chat:\n"
+    "  • Delete a specific time range (e.g. 'remove 0:16 to 1:22', "
+    "'delete the first 20 seconds').\n"
+    "  • Voice: VOICE_DEEPER (1–4 semitones), VOICE_BRIGHTER (1–3 semitones).\n"
+    "  • Loudness: NORMALISE_LOUDNESS (podcast -16 / YouTube -14), "
+    "ADJUST_VOLUME up/down by N dB, BALANCE_SPEAKERS.\n"
+    "  • Cleanup: REMOVE_HUM, REMOVE_BREATHS, TRIM_SILENCE.\n"
+    "Filler-word removal and word-level transcript edits live behind "
+    "dedicated buttons; mention them when relevant.\n\n"
+    "When you reply:\n"
+    "1. NEVER tell the user to 'use the designated button' for things "
+    "above — they ARE executed from chat. "
+    "2. If a previous turn proposed an edit and the user says 'yes/apply/"
+    "do it', that's a confirmation — the parser will re-emit it as a "
+    "structured action automatically; you don't need to apologise.\n"
+    "3. If they ask for something needing details you don't have "
+    "(e.g. 'remove the boring part'), ask one short clarifying question.\n"
+    "4. Stay concise — one or two short sentences. Match the user's language."
 )
 
 
@@ -277,14 +295,28 @@ async def transcribe_project(
     user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Transcribe the project audio with Whisper.
+
+    Strategy for handling Whisper's 25 MB per-request cap:
+      1. Download the source.
+      2. audio_editor.prepare_for_whisper compresses to mono 24 kbps Opus,
+         which is small enough for ~2 hours in one piece.
+      3. If even compressed the file is still too big, it gets chunked into
+         ~10 min pieces. We transcribe each chunk, offset its timestamps,
+         and merge into one transcript.
+    The user's original audio_url is never modified — compression is only
+    for the Whisper call.
+    """
     project = await _get_owned_project(db, project_id, user)
     if not project.audio_url:
         raise HTTPException(status_code=400, detail="Project has no uploaded audio")
     if not os.environ.get("OPENAI_API_KEY"):
         raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
+    if not audio_editor.ffmpeg_available():
+        raise HTTPException(status_code=503, detail="ffmpeg not installed on the server")
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.get(project.audio_url)
             resp.raise_for_status()
             audio_bytes = resp.content
@@ -293,22 +325,71 @@ async def transcribe_project(
         raise HTTPException(status_code=502, detail=f"Could not fetch audio: {exc}")
 
     filename = _filename_from_url(project.audio_url, content_type)
-    audio_buf = io.BytesIO(audio_bytes)
-    audio_buf.name = filename
+    source_ext = os.path.splitext(filename)[1] or ".mp3"
 
-    try:
-        result = await _get_openai_client().audio.transcriptions.create(
-            model=WHISPER_MODEL,
-            file=audio_buf,
-            response_format="verbose_json",
-            timestamp_granularities=["word", "segment"],
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Transcription failed: {exc}")
+    with tempfile.TemporaryDirectory() as work_dir:
+        src_path = os.path.join(work_dir, f"source{source_ext}")
+        with open(src_path, "wb") as f:
+            f.write(audio_bytes)
 
-    transcript = _build_transcript(
-        result.model_dump() if hasattr(result, "model_dump") else dict(result)
-    )
+        try:
+            pieces = await audio_editor.prepare_for_whisper(src_path, work_dir)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=f"Audio preprocessing failed: {exc}")
+
+        client_ai = _get_openai_client()
+        merged_segments: List[dict] = []
+        merged_words: List[dict] = []
+        text_parts: List[str] = []
+        detected_language: Optional[str] = None
+        total_duration = 0.0
+
+        for piece_path, offset in pieces:
+            with open(piece_path, "rb") as f:
+                piece_bytes = f.read()
+            buf = io.BytesIO(piece_bytes)
+            buf.name = os.path.basename(piece_path)
+
+            try:
+                result = await client_ai.audio.transcriptions.create(
+                    model=WHISPER_MODEL,
+                    file=buf,
+                    response_format="verbose_json",
+                    timestamp_granularities=["word", "segment"],
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Transcription failed (chunk @ {offset:.0f}s): {exc}",
+                )
+
+            raw = result.model_dump() if hasattr(result, "model_dump") else dict(result)
+
+            # Offset all timestamps so chunks line up on the original timeline.
+            for s in raw.get("segments") or []:
+                s["start"] = float(s.get("start", 0.0)) + offset
+                s["end"] = float(s.get("end", 0.0)) + offset
+                merged_segments.append(s)
+            for w in raw.get("words") or []:
+                w["start"] = float(w.get("start", 0.0)) + offset
+                w["end"] = float(w.get("end", 0.0)) + offset
+                merged_words.append(w)
+
+            piece_text = (raw.get("text") or "").strip()
+            if piece_text:
+                text_parts.append(piece_text)
+            detected_language = detected_language or raw.get("language")
+            piece_duration = float(raw.get("duration") or 0.0)
+            total_duration = max(total_duration, offset + piece_duration)
+
+    merged_response = {
+        "language": detected_language,
+        "duration": total_duration,
+        "text": " ".join(text_parts),
+        "segments": merged_segments,
+        "words": merged_words,
+    }
+    transcript = _build_transcript(merged_response)
 
     project.transcript = transcript
     flag_modified(project, "transcript")
@@ -324,15 +405,118 @@ async def chat(
     user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _get_owned_project(db, project_id, user)
+    """Stream a chat reply, executing any audio edit the user requests.
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + [
-        {"role": m.role, "content": m.content} for m in payload.messages
-    ]
+    Flow:
+      1. Take the latest user message and ask the intent parser whether
+         it's a structured action (e.g. delete a time range) or just chat.
+      2. If it's an action, execute it server-side, create a new
+         AudioVersion, then emit:
+           data: {"delta": "...reply text..."}
+           data: {"action": {"type": "delete_range", "version_id": N, ...}}
+           data: {"done": true}
+         The client uses the "action" event to reload audio + transcript.
+      3. If it's chat, stream a normal GPT reply.
+    """
+    project = await _get_owned_project(db, project_id, user)
+
+    last_user_message: Optional[str] = next(
+        (m.content for m in reversed(payload.messages) if m.role == "user"),
+        None,
+    )
+    chat_history = [{"role": m.role, "content": m.content} for m in payload.messages]
+    # History EXCLUDING the latest user message — the parser sees it
+    # separately so follow-ups like "yes apply" can be resolved against
+    # what the assistant previously proposed.
+    prior_history = chat_history[:-1] if chat_history and chat_history[-1]["role"] == "user" else chat_history
+    client_ai = _get_openai_client()
+
+    # First: try to classify the user's last message as a structured action.
+    parsed: Optional[dict] = None
+    if last_user_message:
+        try:
+            parsed = await intent_service.extract_intent(
+                client_ai, last_user_message, history=prior_history
+            )
+        except Exception:
+            # Intent parser is best-effort. Fall back to plain chat on any error.
+            parsed = None
 
     async def event_generator():
         try:
-            stream = await _get_openai_client().chat.completions.create(
+            if parsed and parsed.get("action") == "apply_operation":
+                op = parsed.get("operation") or {}
+                op_type = op.get("type") or ""
+                op_params = op.get("params") or {}
+                try:
+                    async with SessionLocal() as edit_db:
+                        edit_project = await _get_owned_project(
+                            edit_db, project_id, user
+                        )
+                        version = await _execute_apply_operation(
+                            db=edit_db,
+                            project=edit_project,
+                            user=user,
+                            op_type=op_type,
+                            op_params=op_params,
+                        )
+                        version_payload = {
+                            "type": "apply_operation",
+                            "operation": op_type,
+                            "version_id": version.id,
+                            "audio_url": version.audio_url,
+                        }
+                except HTTPException as exc:
+                    yield f"data: {json.dumps({'delta': f'⚠️ {exc.detail}'})}\n\n"
+                    yield f"data: {json.dumps({'done': True})}\n\n"
+                    return
+
+                reply = parsed.get("reply") or f"Applied {op_type.lower().replace('_', ' ')}."
+                yield f"data: {json.dumps({'delta': reply})}\n\n"
+                yield f"data: {json.dumps({'action': version_payload})}\n\n"
+                yield f"data: {json.dumps({'done': True})}\n\n"
+                return
+
+            if parsed and parsed.get("action") == "delete_range":
+                # FastAPI closes the injected `db` session as soon as this
+                # streaming handler returns, which races with the writes
+                # we'd do inside the generator. Open a fresh session whose
+                # lifetime we control end-to-end.
+                try:
+                    async with SessionLocal() as edit_db:
+                        edit_project = await _get_owned_project(
+                            edit_db, project_id, user
+                        )
+                        version = await _execute_delete_range(
+                            db=edit_db,
+                            project=edit_project,
+                            user=user,
+                            start=float(parsed["start_seconds"]),
+                            end=float(parsed["end_seconds"]),
+                        )
+                        version_payload = {
+                            "type": "delete_range",
+                            "version_id": version.id,
+                            "audio_url": version.audio_url,
+                        }
+                except HTTPException as exc:
+                    # Surface the backend error as a chat message.
+                    yield f"data: {json.dumps({'delta': f'⚠️ {exc.detail}'})}\n\n"
+                    yield f"data: {json.dumps({'done': True})}\n\n"
+                    return
+
+                reply = parsed.get("reply") or (
+                    f"Removed {parsed['start_seconds']:.0f}s to {parsed['end_seconds']:.0f}s."
+                )
+                # Send as one delta so the UI shows the full sentence immediately.
+                yield f"data: {json.dumps({'delta': reply})}\n\n"
+                yield f"data: {json.dumps({'action': version_payload})}\n\n"
+                yield f"data: {json.dumps({'done': True})}\n\n"
+                return
+
+            # Plain chat: stream a normal reply.
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + chat_history
+            stream = await client_ai.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=messages,
                 stream=True,
@@ -346,6 +530,205 @@ async def chat(
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+async def _execute_apply_operation(
+    *,
+    db: AsyncSession,
+    project: Project,
+    user: dict,
+    op_type: str,
+    op_params: dict,
+) -> AudioVersion:
+    """Apply a Phase-A FFmpeg primitive (hum/loudness/pitch/etc.) and create
+    a new AudioVersion. Mirrors the apply_operation HTTP endpoint but runs
+    in-process so the chat handler can call it directly."""
+    if not project.audio_url:
+        raise HTTPException(status_code=400, detail="Project has no audio")
+    if not audio_editor.ffmpeg_available():
+        raise HTTPException(status_code=503, detail="ffmpeg not installed on the server")
+    if not storage_configured():
+        raise HTTPException(status_code=503, detail="Storage not configured")
+
+    op_type_norm = (op_type or "").upper()
+    if op_type_norm not in audio_editor.SUPPORTED_OPERATIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported operation: {op_type}",
+        )
+    try:
+        audio_filter, default_label = audio_editor.build_operation_filter(
+            op_type_norm, op_params or {}
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    source_url = project.audio_url
+    source_transcript = project.transcript
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src_path = os.path.join(tmp, "in.mp3")
+        out_path = os.path.join(tmp, "out.mp3")
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.get(source_url)
+                resp.raise_for_status()
+                with open(src_path, "wb") as f:
+                    f.write(resp.content)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Fetch source audio: {exc}")
+
+        try:
+            await audio_editor.apply_audio_filter(src_path, out_path, audio_filter)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        with open(out_path, "rb") as f:
+            rendered = f.read()
+        new_duration = await audio_editor.probe_duration(out_path)
+
+    try:
+        public_url = await storage_upload(
+            user_id=_user_id(user),
+            filename=f"chat_op_{op_type_norm.lower()}_{project.id}.mp3",
+            data=rendered,
+            content_type="audio/mpeg",
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Upload processed audio: {exc}")
+
+    # FFmpeg filters that change duration (TRIM_SILENCE) shift transcript
+    # timestamps too. For everything else duration is unchanged. We carry
+    # the source transcript through and just update the duration field — a
+    # proper retranscription on duration-changing ops can be a follow-up.
+    new_transcript = copy.deepcopy(source_transcript) if source_transcript else None
+    if new_transcript is not None:
+        new_transcript["duration"] = new_duration
+
+    version = AudioVersion(
+        project_id=project.id,
+        parent_id=project.active_version_id,
+        label=default_label,
+        audio_url=public_url,
+        transcript=new_transcript,
+        duration=new_duration,
+    )
+    db.add(version)
+    await db.flush()
+
+    project.audio_url = public_url
+    project.transcript = new_transcript
+    project.active_version_id = version.id
+    if new_transcript is not None:
+        flag_modified(project, "transcript")
+    await db.commit()
+    await db.refresh(version)
+    return version
+
+
+async def _execute_delete_range(
+    *,
+    db: AsyncSession,
+    project: Project,
+    user: dict,
+    start: float,
+    end: float,
+) -> AudioVersion:
+    """Same machinery as the /operations/delete-range endpoint, callable
+    in-process from the chat handler. Raises HTTPException on any failure
+    so the chat stream can surface a clean error."""
+    if not project.audio_url:
+        raise HTTPException(status_code=400, detail="Project has no audio")
+    if not audio_editor.ffmpeg_available():
+        raise HTTPException(status_code=503, detail="ffmpeg not installed on the server")
+    if not storage_configured():
+        raise HTTPException(status_code=503, detail="Storage not configured")
+
+    start = max(0.0, float(start))
+    end = float(end)
+    if end <= start:
+        raise HTTPException(status_code=400, detail="end must be greater than start")
+
+    source_url = project.audio_url
+    source_transcript = project.transcript
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src_path = os.path.join(tmp, "in.mp3")
+        out_path = os.path.join(tmp, "out.mp3")
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.get(source_url)
+                resp.raise_for_status()
+                with open(src_path, "wb") as f:
+                    f.write(resp.content)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Fetch source audio: {exc}")
+
+        duration = await audio_editor.probe_duration(src_path)
+        if duration <= 0:
+            raise HTTPException(status_code=500, detail="Could not probe audio duration")
+        end = min(end, duration)
+        if end <= start:
+            raise HTTPException(
+                status_code=400,
+                detail=f"That range is outside the {duration:.0f}s audio",
+            )
+
+        keeps = audio_editor.keep_ranges([(start, end)], duration)
+        if not keeps:
+            raise HTTPException(
+                status_code=400,
+                detail="Deleting that range would remove the entire audio",
+            )
+
+        try:
+            await audio_editor.render_with_keeps(src_path, keeps, out_path)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        with open(out_path, "rb") as f:
+            rendered = f.read()
+        new_duration = await audio_editor.probe_duration(out_path)
+
+    try:
+        public_url = await storage_upload(
+            user_id=_user_id(user),
+            filename=f"chat_cut_{project.id}.mp3",
+            data=rendered,
+            content_type="audio/mpeg",
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Upload processed audio: {exc}")
+
+    new_transcript = _shift_transcript_after_delete(source_transcript, start, end)
+    if new_transcript is not None:
+        new_transcript["duration"] = new_duration
+
+    def _fmt(t: float) -> str:
+        m, s = divmod(int(t), 60)
+        return f"{m}:{s:02d}"
+
+    version = AudioVersion(
+        project_id=project.id,
+        parent_id=project.active_version_id,
+        label=f"Removed {_fmt(start)}–{_fmt(end)}",
+        audio_url=public_url,
+        transcript=new_transcript,
+        duration=new_duration,
+    )
+    db.add(version)
+    await db.flush()
+
+    project.audio_url = public_url
+    project.transcript = new_transcript
+    project.active_version_id = version.id
+    if new_transcript is not None:
+        flag_modified(project, "transcript")
+    await db.commit()
+    await db.refresh(version)
+    return version
 
 
 @router.get("/{project_id}/processing", response_model=ProcessingStatus)
@@ -919,6 +1302,182 @@ async def apply_operation(
         project_id=project_id,
         parent_id=parent_id,
         label=payload.label or default_label,
+        audio_url=public_url,
+        transcript=new_transcript,
+        duration=new_duration,
+    )
+    db.add(version)
+    await db.flush()
+
+    project.audio_url = public_url
+    project.transcript = new_transcript
+    project.active_version_id = version.id
+    if new_transcript is not None:
+        flag_modified(project, "transcript")
+    await db.commit()
+    await db.refresh(version)
+    return AudioVersionOut.model_validate(version)
+
+
+def _shift_transcript_after_delete(
+    transcript: Optional[dict], start: float, end: float
+) -> Optional[dict]:
+    """After deleting [start,end) from the audio, drop words that fell in
+    the cut and shift everything after it earlier by (end - start).
+    Returns a new dict; caller is responsible for re-flagging the JSON column."""
+    if not transcript:
+        return transcript
+    cut = max(0.0, end - start)
+    new_segments: List[dict] = []
+    for seg in transcript.get("segments") or []:
+        seg_start = float(seg.get("start", 0.0))
+        seg_end = float(seg.get("end", 0.0))
+        # Segment lies entirely inside the deleted window — drop it.
+        if seg_end <= start or seg_start >= end:
+            # Outside the cut. If it's after, shift it.
+            if seg_start >= end:
+                seg = {
+                    **seg,
+                    "start": seg_start - cut,
+                    "end": seg_end - cut,
+                    "words": [
+                        {**w, "start": float(w.get("start", 0.0)) - cut,
+                         "end": float(w.get("end", 0.0)) - cut}
+                        for w in (seg.get("words") or [])
+                        if float(w.get("start", 0.0)) >= end
+                    ],
+                }
+            new_segments.append(seg)
+            continue
+        # Segment straddles or sits inside the cut — keep words outside the window.
+        kept_words = []
+        for w in seg.get("words") or []:
+            ws = float(w.get("start", 0.0))
+            we = float(w.get("end", ws))
+            if we <= start:
+                kept_words.append({**w})
+            elif ws >= end:
+                kept_words.append({**w, "start": ws - cut, "end": we - cut})
+            # else: word overlaps the cut — drop it
+        if not kept_words:
+            continue
+        new_segments.append({
+            **seg,
+            "start": kept_words[0]["start"],
+            "end": kept_words[-1]["end"],
+            "words": kept_words,
+            "text": " ".join(w.get("text", "").strip() for w in kept_words).strip(),
+        })
+    full_text = " ".join(s.get("text", "").strip() for s in new_segments).strip()
+    return {
+        **transcript,
+        "duration": max(0.0, float(transcript.get("duration", 0.0)) - cut),
+        "text": full_text,
+        "segments": new_segments,
+    }
+
+
+@router.post("/{project_id}/operations/delete-range", response_model=AudioVersionOut)
+async def delete_range(
+    project_id: int,
+    payload: DeleteRangeRequest,
+    user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a single time range from the project audio.
+
+    Uses the existing render_with_keeps path (with a tiny crossfade at the
+    splice point), updates the transcript by removing words inside the cut
+    and shifting timestamps after it. Creates a new AudioVersion.
+    """
+    project = await _get_owned_project(db, project_id, user)
+    if not project.audio_url:
+        raise HTTPException(status_code=400, detail="Project has no audio")
+    if not audio_editor.ffmpeg_available():
+        raise HTTPException(status_code=503, detail="ffmpeg not installed on the server")
+    if not storage_configured():
+        raise HTTPException(status_code=503, detail="Storage not configured")
+
+    start = max(0.0, float(payload.start_seconds))
+    end = float(payload.end_seconds)
+    if end <= start:
+        raise HTTPException(status_code=400, detail="end_seconds must be greater than start_seconds")
+
+    # Pick source.
+    source_url = project.audio_url
+    source_transcript = project.transcript
+    parent_id = payload.parent_version_id
+    if parent_id is not None:
+        result = await db.execute(
+            select(AudioVersion).where(
+                AudioVersion.id == parent_id,
+                AudioVersion.project_id == project_id,
+            )
+        )
+        parent = result.scalar_one_or_none()
+        if parent:
+            source_url = parent.audio_url
+            source_transcript = parent.transcript or source_transcript
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src_path = os.path.join(tmp, "in.mp3")
+        out_path = os.path.join(tmp, "out.mp3")
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.get(source_url)
+                resp.raise_for_status()
+                with open(src_path, "wb") as f:
+                    f.write(resp.content)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Fetch source audio: {exc}")
+
+        duration = await audio_editor.probe_duration(src_path)
+        if duration <= 0:
+            raise HTTPException(status_code=500, detail="Could not probe audio duration")
+        # Clamp end to the source duration so the user can say "remove from 30s to forever".
+        end = min(end, duration)
+        if end <= start:
+            raise HTTPException(status_code=400, detail="Range is outside the audio")
+
+        keeps = audio_editor.keep_ranges([(start, end)], duration)
+        if not keeps:
+            raise HTTPException(
+                status_code=400,
+                detail="Deleting that range would remove the entire audio",
+            )
+
+        try:
+            await audio_editor.render_with_keeps(src_path, keeps, out_path)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        with open(out_path, "rb") as f:
+            rendered = f.read()
+        new_duration = await audio_editor.probe_duration(out_path)
+
+    try:
+        public_url = await storage_upload(
+            user_id=_user_id(user),
+            filename=f"cut_{project_id}.mp3",
+            data=rendered,
+            content_type="audio/mpeg",
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Upload processed audio: {exc}")
+
+    new_transcript = _shift_transcript_after_delete(source_transcript, start, end)
+    if new_transcript is not None:
+        new_transcript["duration"] = new_duration
+
+    def _fmt(t: float) -> str:
+        m, s = divmod(int(t), 60)
+        return f"{m}:{s:02d}"
+
+    version = AudioVersion(
+        project_id=project_id,
+        parent_id=parent_id,
+        label=payload.label or f"Removed {_fmt(start)}–{_fmt(end)}",
         audio_url=public_url,
         transcript=new_transcript,
         duration=new_duration,

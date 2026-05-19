@@ -128,7 +128,7 @@ export async function activateVersion({ id, versionId, getToken } = {}) {
   return handleJson(res)
 }
 
-export async function streamChat({ projectId, messages, getToken, onDelta, signal }) {
+export async function streamChat({ projectId, messages, getToken, onDelta, onAction, signal }) {
   const token = await getToken()
   const res = await fetch(`${API_URL}/projects/${projectId}/chat`, {
     method: 'POST',
@@ -169,6 +169,10 @@ export async function streamChat({ projectId, messages, getToken, onDelta, signa
         const data = JSON.parse(line.slice(6))
         if (data.error) throw new Error(data.error)
         if (data.delta) onDelta(data.delta)
+        // The backend emits {action: {...}} when chat triggered an actual edit
+        // (e.g. deleting a time range). The caller uses it to refresh the
+        // editor's audio + transcript without a separate round-trip.
+        if (data.action && typeof onAction === 'function') onAction(data.action)
         if (data.done) return
       } catch (e) {
         if (e instanceof SyntaxError) continue

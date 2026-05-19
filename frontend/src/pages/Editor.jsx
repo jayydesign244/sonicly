@@ -771,6 +771,27 @@ export default function Editor() {
             return next
           })
         },
+        onAction: async (action) => {
+          // Backend executed an edit (e.g. delete_range) and gave us a new
+          // version. Pull the fresh project + versions so the waveform and
+          // transcript reflect the change.
+          if (action?.version_id) setActiveVersionId(action.version_id)
+          if (action?.audio_url) setAudioUrl(action.audio_url)
+          try {
+            const [freshProject, freshVersions] = await Promise.all([
+              getProject({ id: project.id, getToken }),
+              listVersions({ id: project.id, getToken }),
+            ])
+            if (freshProject?.transcript) setTranscript(freshProject.transcript)
+            if (freshProject?.audio_url) setAudioUrl(freshProject.audio_url)
+            setVersions(freshVersions || [])
+            pending.clear()
+          } catch (err) {
+            // Refresh failed but the edit succeeded server-side; user can
+            // hit a version pill or refresh manually to recover.
+            setEditError(`Edit applied but refresh failed: ${err.message}`)
+          }
+        },
       })
     } catch (err) {
       setMessages(prev => {

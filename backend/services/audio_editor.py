@@ -139,7 +139,7 @@ async def render_with_keeps(
         _ff(), "-y", "-i", source_path,
         "-filter_complex", filter_complex,
         "-map", "[out]",
-        "-c:a", "libmp3lame", "-b:a", "192k",
+        "-c:a", "libmp3lame", "-b:a", "128k",
         out_path,
     ]
     await _run(cmd)
@@ -214,7 +214,7 @@ async def render_with_ops(
     cmd.extend([
         "-filter_complex", filter_complex,
         "-map", "[out]",
-        "-c:a", "libmp3lame", "-b:a", "192k",
+        "-c:a", "libmp3lame", "-b:a", "128k",
         out_path,
     ])
     await _run(cmd)
@@ -237,6 +237,75 @@ async def transcode(source_path: str, out_path: str, fmt: str) -> None:
 _DUR_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)")
 
 
+# Whisper has a 25 MB per-request hard cap. We compress to mono 24 kbps Opus
+# (speech-grade, indistinguishable to Whisper from higher bitrates) and only
+# chunk when even compression isn't enough.
+WHISPER_MAX_BYTES = 25 * 1024 * 1024
+WHISPER_SIZE_BUDGET = 24 * 1024 * 1024  # 1 MB safety margin under the hard cap
+WHISPER_CHUNK_SECONDS = 600  # 10 min — comfortably under the budget at 24 kbps
+
+
+async def _compress_for_whisper(src: str, out: str) -> None:
+    """Mono 24 kbps Opus. Speech-optimised, accepted natively by Whisper.
+
+    Quality is identical to higher bitrates for transcription (Whisper
+    downsamples to 16 kHz mono internally) but the file is 5-10x smaller.
+    """
+    cmd = [
+        _ff(), "-y", "-i", src,
+        "-vn", "-ac", "1",
+        "-c:a", "libopus", "-b:a", "24k",
+        "-application", "voip",
+        out,
+    ]
+    await _run(cmd)
+
+
+async def prepare_for_whisper(src: str, work_dir: str) -> List[Tuple[str, float]]:
+    """Produce Whisper-ready file(s) from a source audio path.
+
+    Returns a list of ``(file_path, start_offset_seconds)``. Callers
+    transcribe each piece and add ``start_offset_seconds`` to every word
+    and segment timestamp before merging the results.
+
+    Strategy:
+      1. Always compress to mono 24 kbps Opus (small, lossless for speech).
+      2. If still over the budget, fall back to splitting the source into
+         ~10 min chunks at the same bitrate (segment muxer, accurate cuts).
+    """
+    compressed = os.path.join(work_dir, "for_whisper.ogg")
+    await _compress_for_whisper(src, compressed)
+    if os.path.getsize(compressed) <= WHISPER_SIZE_BUDGET:
+        return [(compressed, 0.0)]
+
+    # Compressed single file still too big → chunk. We re-encode to Opus
+    # in the same pass since the segment muxer needs a re-encode anyway
+    # to set fresh container metadata per chunk.
+    os.remove(compressed)
+    chunk_pattern = os.path.join(work_dir, "chunk_%03d.ogg")
+    cmd = [
+        _ff(), "-y", "-i", src,
+        "-vn", "-ac", "1",
+        "-c:a", "libopus", "-b:a", "24k",
+        "-application", "voip",
+        "-f", "segment",
+        "-segment_time", str(WHISPER_CHUNK_SECONDS),
+        "-reset_timestamps", "1",
+        chunk_pattern,
+    ]
+    await _run(cmd)
+    chunks = sorted(
+        f for f in os.listdir(work_dir)
+        if f.startswith("chunk_") and f.endswith(".ogg")
+    )
+    if not chunks:
+        raise RuntimeError("ffmpeg produced no chunks")
+    return [
+        (os.path.join(work_dir, name), float(i * WHISPER_CHUNK_SECONDS))
+        for i, name in enumerate(chunks)
+    ]
+
+
 async def apply_audio_filter(
     source_path: str, out_path: str, audio_filter: str
 ) -> None:
@@ -244,7 +313,7 @@ async def apply_audio_filter(
     cmd = [
         _ff(), "-y", "-i", source_path,
         "-af", audio_filter,
-        "-c:a", "libmp3lame", "-b:a", "192k",
+        "-c:a", "libmp3lame", "-b:a", "128k",
         out_path,
     ]
     await _run(cmd)

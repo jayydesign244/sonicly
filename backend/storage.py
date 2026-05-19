@@ -47,7 +47,16 @@ async def _upload_supabase(object_path: str, data: bytes, content_type: str) -> 
     upload_url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{object_path}"
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(upload_url, content=data, headers=_headers(content_type))
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # raise_for_status() hides the response body, which is exactly the
+            # info we need from Supabase to diagnose (bucket missing, RLS
+            # policy, mime restrictions, etc.). Pull it into the message.
+            body = resp.text[:400] if resp.text else "(empty body)"
+            raise httpx.HTTPStatusError(
+                f"Supabase upload {resp.status_code} for {object_path}: {body}",
+                request=resp.request,
+                response=resp,
+            )
     return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{object_path}"
 
 

@@ -102,6 +102,14 @@ class ApplyOperationRequest(BaseModel):
     label: Optional[str] = None
 
 
+class DeleteRangeRequest(BaseModel):
+    """Cut a single time range out of the audio. Timestamps in seconds."""
+    start_seconds: float
+    end_seconds: float
+    parent_version_id: Optional[int] = None
+    label: Optional[str] = None
+
+
 class FillersResponse(BaseModel):
     fillers: List[WordRef]
     total: int
