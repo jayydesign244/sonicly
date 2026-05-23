@@ -319,10 +319,10 @@ async def apply_audio_filter(
     await _run(cmd)
 
 
-# Supported one-shot operations. Each maps to an ffmpeg -af filter chain.
-# Operations that need params build the chain via build_operation_filter().
-# Mirrors the operation catalogue in services/intent.py — keep both in sync.
-SUPPORTED_OPERATIONS = {
+# FFmpeg-only operations — each maps to an ffmpeg -af filter chain built
+# by build_operation_filter() below. These can be safely chained together
+# into a single ffmpeg pass.
+FFMPEG_OPERATIONS = {
     # Noise / cleanup
     "REMOVE_HUM",
     "REMOVE_WIND",
@@ -343,7 +343,7 @@ SUPPORTED_OPERATIONS = {
     "REDUCE_AIR",
     "ADD_BASS",
     "REDUCE_BASS",
-    # Presets
+    # Presets (multi-filter chains in one pass)
     "VOICE_PODCAST",
     "VOICE_RADIO",
     # Dynamics
@@ -356,6 +356,49 @@ SUPPORTED_OPERATIONS = {
     # Content
     "TRIM_SILENCE",
 }
+
+# API-backed operations — handled by the chat handler via service modules
+# (ElevenLabs Voice Isolator, etc.), not by build_operation_filter().
+API_OPERATIONS = {
+    "NOISE_REMOVAL",
+    "REMOVE_REVERB",
+}
+
+# Transcript-aware operations — need the project transcript to figure out
+# which time ranges to cut. Handled bespoke in the chat handler.
+TRANSCRIPT_OPERATIONS = {
+    "REMOVE_FILLERS",
+}
+
+# Meta operations — expand into a fixed sequence of other ops before
+# execution. Lets natural prompts like "make it better" map to a curated
+# cleanup pipeline.
+META_OPERATIONS = {
+    # Per audio_processing_map.md "FULL_CLEANUP" execution order:
+    #   isolator → highpass → compressor → loudnorm → silence trim.
+    # REMOVE_HUM 50Hz approximates the highpass; the rest map 1:1.
+    "FULL_CLEANUP": [
+        ("NOISE_REMOVAL",      {}),
+        ("REMOVE_HUM",         {"hz": 50}),
+        ("COMPRESS_DYNAMICS",  {"intensity": "medium"}),
+        ("NORMALISE_LOUDNESS", {"target": "podcast"}),
+        ("TRIM_SILENCE",       {}),
+    ],
+    # Authoritative = body/presence EQ + subtle pitch deepening + comp.
+    "VOICE_AUTHORITATIVE": [
+        ("FIX_BOXY",           {}),
+        ("VOICE_WARMER",       {"intensity": "medium"}),
+        ("ADD_PRESENCE",       {}),
+        ("COMPRESS_DYNAMICS",  {"intensity": "medium"}),
+        ("VOICE_DEEPER",       {"semitones": 1}),
+    ],
+}
+
+# Union of every op type the chat layer is allowed to emit. Mirrors the
+# operation catalogue in services/intent.py — keep both in sync.
+SUPPORTED_OPERATIONS = (
+    FFMPEG_OPERATIONS | API_OPERATIONS | TRANSCRIPT_OPERATIONS | set(META_OPERATIONS.keys())
+)
 
 
 def _pitch_filter(semitones: float) -> str:
@@ -588,10 +631,18 @@ def _filter_limiter() -> str:
 
 
 def build_operation_filter(op_type: str, params: dict) -> Tuple[str, str]:
-    """Return (audio_filter, default_label) for a given operation.
+    """Return (audio_filter, default_label) for a single-pass FFmpeg op.
 
-    Raises ValueError for unknown ops or invalid params.
+    API ops, transcript ops, and meta ops are NOT handled here — the
+    chat pipeline runs them via dedicated code paths. Raises ValueError
+    for unknown ops or invalid params.
     """
+    if op_type in API_OPERATIONS:
+        raise ValueError(f"{op_type} is an API op — use the service module, not a filter chain")
+    if op_type in TRANSCRIPT_OPERATIONS:
+        raise ValueError(f"{op_type} is a transcript op — needs the project transcript")
+    if op_type in META_OPERATIONS:
+        raise ValueError(f"{op_type} is a meta op — expand to sub-ops before calling this")
     p = params or {}
 
     # ---- Noise / cleanup --------------------------------------------------

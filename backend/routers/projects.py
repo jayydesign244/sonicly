@@ -3,6 +3,7 @@ import io
 import os
 import json
 import re
+import shutil
 import tempfile
 import httpx
 from fastapi import APIRouter, HTTPException, UploadFile, File, Depends
@@ -444,87 +445,64 @@ async def chat(
 
     async def event_generator():
         try:
-            if parsed and parsed.get("action") == "apply_operation":
-                op = parsed.get("operation") or {}
-                op_type = op.get("type") or ""
-                op_params = op.get("params") or {}
-                try:
-                    async with SessionLocal() as edit_db:
-                        edit_project = await _get_owned_project(
-                            edit_db, project_id, user
-                        )
-                        version = await _execute_apply_operation(
-                            db=edit_db,
-                            project=edit_project,
-                            user=user,
-                            op_type=op_type,
-                            op_params=op_params,
-                        )
-                        version_payload = {
-                            "type": "apply_operation",
-                            "operation": op_type,
-                            "version_id": version.id,
-                            "audio_url": version.audio_url,
-                        }
-                except HTTPException as exc:
-                    yield f"data: {json.dumps({'delta': f'⚠️ {exc.detail}'})}\n\n"
-                    yield f"data: {json.dumps({'done': True})}\n\n"
-                    return
+            ops = (parsed or {}).get("operations") or []
+            parser_reply = (parsed or {}).get("reply") or ""
+            suggestions = (parsed or {}).get("suggestions")
 
-                reply = parsed.get("reply") or f"Applied {op_type.lower().replace('_', ' ')}."
-                yield f"data: {json.dumps({'delta': reply})}\n\n"
-                yield f"data: {json.dumps({'action': version_payload})}\n\n"
+            # ---- No structured ops: chat-only path ------------------------
+            if not ops:
+                # Trust the intent parser's reply when it gave one (it
+                # already knows the user's language and intent). Only
+                # fall back to streaming a fresh GPT chat if the parser
+                # didn't produce a reply for some reason.
+                if parser_reply:
+                    yield f"data: {json.dumps({'delta': parser_reply})}\n\n"
+                else:
+                    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + chat_history
+                    stream = await client_ai.chat.completions.create(
+                        model=OPENAI_MODEL,
+                        messages=messages,
+                        stream=True,
+                    )
+                    async for chunk in stream:
+                        delta = chunk.choices[0].delta.content if chunk.choices else None
+                        if delta:
+                            yield f"data: {json.dumps({'delta': delta})}\n\n"
+                if suggestions:
+                    yield f"data: {json.dumps({'suggestions': suggestions})}\n\n"
                 yield f"data: {json.dumps({'done': True})}\n\n"
                 return
 
-            if parsed and parsed.get("action") == "delete_range":
-                # FastAPI closes the injected `db` session as soon as this
-                # streaming handler returns, which races with the writes
-                # we'd do inside the generator. Open a fresh session whose
-                # lifetime we control end-to-end.
-                try:
-                    async with SessionLocal() as edit_db:
-                        edit_project = await _get_owned_project(
-                            edit_db, project_id, user
-                        )
-                        version = await _execute_delete_range(
-                            db=edit_db,
-                            project=edit_project,
-                            user=user,
-                            start=float(parsed["start_seconds"]),
-                            end=float(parsed["end_seconds"]),
-                        )
-                        version_payload = {
-                            "type": "delete_range",
-                            "version_id": version.id,
-                            "audio_url": version.audio_url,
-                        }
-                except HTTPException as exc:
-                    # Surface the backend error as a chat message.
-                    yield f"data: {json.dumps({'delta': f'⚠️ {exc.detail}'})}\n\n"
-                    yield f"data: {json.dumps({'done': True})}\n\n"
-                    return
-
-                reply = parsed.get("reply") or (
-                    f"Removed {parsed['start_seconds']:.0f}s to {parsed['end_seconds']:.0f}s."
-                )
-                # Send as one delta so the UI shows the full sentence immediately.
-                yield f"data: {json.dumps({'delta': reply})}\n\n"
-                yield f"data: {json.dumps({'action': version_payload})}\n\n"
+            # ---- Multi-op pipeline ----------------------------------------
+            # FastAPI closes the injected `db` session as soon as this
+            # streaming handler returns, which races with the writes we'd
+            # do inside the generator. Open a fresh session whose lifetime
+            # we control end-to-end.
+            try:
+                async with SessionLocal() as edit_db:
+                    edit_project = await _get_owned_project(
+                        edit_db, project_id, user
+                    )
+                    version, executed_types = await _run_op_pipeline(
+                        db=edit_db,
+                        project=edit_project,
+                        user=user,
+                        ops=ops,
+                    )
+                    version_payload = {
+                        "type": "pipeline",
+                        "operations": executed_types,
+                        "version_id": version.id,
+                        "audio_url": version.audio_url,
+                    }
+            except HTTPException as exc:
+                yield f"data: {json.dumps({'delta': f'⚠️ {exc.detail}'})}\n\n"
                 yield f"data: {json.dumps({'done': True})}\n\n"
                 return
 
-            # Plain chat: stream a normal reply.
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + chat_history
-            stream = await client_ai.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=messages,
-                stream=True,
-            )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta.content if chunk.choices else None
-                if delta:
-                    yield f"data: {json.dumps({'delta': delta})}\n\n"
+            reply = parser_reply or "Done."
+            yield f"data: {json.dumps({'delta': reply})}\n\n"
+            yield f"data: {json.dumps({'action': version_payload})}\n\n"
             yield f"data: {json.dumps({'done': True})}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
@@ -551,7 +529,9 @@ async def _execute_apply_operation(
         raise HTTPException(status_code=503, detail="Storage not configured")
 
     op_type_norm = (op_type or "").upper()
-    if op_type_norm not in audio_editor.SUPPORTED_OPERATIONS:
+    # Single-pass FFmpeg only. The multi-op pipeline in /chat handles
+    # API ops, transcript ops, and meta pipelines.
+    if op_type_norm not in audio_editor.FFMPEG_OPERATIONS:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported operation: {op_type}",
@@ -729,6 +709,310 @@ async def _execute_delete_range(
     await db.commit()
     await db.refresh(version)
     return version
+
+
+# ---- Multi-op chat pipeline ------------------------------------------------
+# Canonical processing order from audio_processing_map.md SECTION 5. Lower
+# numbers run earlier. Ops without an explicit order land at the default 50.
+_OP_ORDER = {
+    "NOISE_REMOVAL":       10,
+    "REMOVE_REVERB":       10,
+    "NOISE_GATE":          20,
+    "REMOVE_HUM":          30,
+    "REMOVE_WIND":         30,
+    "REMOVE_PLOSIVES":     30,
+    "REMOVE_MOUTH_SOUNDS": 30,
+    "REMOVE_FILLERS":      40,
+    "TRIM_SILENCE":        42,
+    "delete_range":        45,
+    "REMOVE_BREATHS":      50,
+    "FIX_MUDDY":           60,
+    "FIX_TINNY":           60,
+    "FIX_BOXY":            60,
+    "FIX_NASAL":           60,
+    "REDUCE_BASS":         60,
+    "REDUCE_AIR":          60,
+    "VOICE_WARMER":        65,
+    "VOICE_BRIGHTER":      65,
+    "ADD_PRESENCE":        65,
+    "ADD_AIR":             65,
+    "ADD_BASS":            65,
+    "REMOVE_SIBILANCE":    70,   # de-ess after EQ
+    "BALANCE_SPEAKERS":    75,
+    "COMPRESS_DYNAMICS":   80,
+    "VOICE_DEEPER":        85,
+    "ADJUST_VOLUME":       90,
+    "NORMALISE_LOUDNESS":  95,
+    "VOICE_PODCAST":       95,   # preset, late stage
+    "VOICE_RADIO":         95,
+    "LIMIT_PEAKS":         99,
+}
+
+
+def _op_sort_key(op: dict) -> int:
+    if op.get("kind") == "delete_range":
+        return _OP_ORDER.get("delete_range", 50)
+    return _OP_ORDER.get(op.get("type") or "", 50)
+
+
+def _expand_meta_ops(ops: List[dict]) -> List[dict]:
+    """Expand meta operations (FULL_CLEANUP, VOICE_AUTHORITATIVE) into the
+    fixed sub-operation lists declared in audio_editor.META_OPERATIONS."""
+    expanded: List[dict] = []
+    for op in ops:
+        if op.get("kind") == "apply_operation":
+            t = op.get("type")
+            if t in audio_editor.META_OPERATIONS:
+                for sub_type, sub_params in audio_editor.META_OPERATIONS[t]:
+                    expanded.append({
+                        "kind": "apply_operation",
+                        "type": sub_type,
+                        "params": dict(sub_params or {}),
+                    })
+                continue
+        expanded.append(op)
+    return expanded
+
+
+def _fmt_mmss(t: float) -> str:
+    m, s = divmod(int(t), 60)
+    return f"{m}:{s:02d}"
+
+
+async def _run_op_pipeline(
+    *,
+    db: AsyncSession,
+    project: Project,
+    user: dict,
+    ops: List[dict],
+) -> Tuple[AudioVersion, List[str]]:
+    """Execute a chain of ops on the project audio, producing one new
+    AudioVersion. Returns (version, executed_op_types).
+
+    The pipeline walks ops in canonical processing order on a working
+    file, hopping from one temp file to the next per op:
+      • FFmpeg ops          -> audio_editor.apply_audio_filter
+      • API ops (NOISE/REVERB) -> voice.audio_isolate
+      • REMOVE_FILLERS      -> fillers_service.find_fillers + render_with_keeps
+      • delete_range        -> render_with_keeps with the inverted range
+    Meta ops (FULL_CLEANUP, VOICE_AUTHORITATIVE) are expanded first.
+    """
+    if not project.audio_url:
+        raise HTTPException(status_code=400, detail="Project has no audio")
+    if not audio_editor.ffmpeg_available():
+        raise HTTPException(status_code=503, detail="ffmpeg not installed on the server")
+    if not storage_configured():
+        raise HTTPException(status_code=503, detail="Storage not configured")
+
+    ordered = sorted(_expand_meta_ops(ops), key=_op_sort_key)
+    if not ordered:
+        raise HTTPException(status_code=400, detail="No executable operations")
+
+    executed_types: List[str] = []
+    labels: List[str] = []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src_path = os.path.join(tmp, "src.mp3")
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.get(project.audio_url)
+                resp.raise_for_status()
+                with open(src_path, "wb") as f:
+                    f.write(resp.content)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Fetch source audio: {exc}")
+
+        current_path = src_path
+        current_transcript = project.transcript
+
+        for i, op in enumerate(ordered):
+            next_path = os.path.join(tmp, f"step_{i:02d}.mp3")
+            kind = op.get("kind")
+
+            # ---- delete_range ---------------------------------------------
+            if kind == "delete_range":
+                start = max(0.0, float(op["start_seconds"]))
+                end = float(op["end_seconds"])
+                duration = await audio_editor.probe_duration(current_path)
+                if duration <= 0:
+                    raise HTTPException(status_code=500, detail="Could not probe audio duration")
+                end = min(end, duration)
+                if end <= start:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Range outside the {duration:.0f}s audio",
+                    )
+                keeps = audio_editor.keep_ranges([(start, end)], duration)
+                if not keeps:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="That range would remove the entire audio",
+                    )
+                try:
+                    await audio_editor.render_with_keeps(current_path, keeps, next_path)
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=500, detail=str(exc))
+                current_transcript = _shift_transcript_after_delete(
+                    current_transcript, start, end
+                )
+                labels.append(f"Removed {_fmt_mmss(start)}–{_fmt_mmss(end)}")
+                executed_types.append("delete_range")
+                current_path = next_path
+                continue
+
+            # ---- apply_operation ------------------------------------------
+            if kind != "apply_operation":
+                continue
+            op_type = (op.get("type") or "").upper()
+            params = op.get("params") or {}
+
+            # API op: ElevenLabs Voice Isolator handles noise + reverb
+            if op_type in audio_editor.API_OPERATIONS:
+                if not voice_service.is_configured():
+                    raise HTTPException(
+                        status_code=503,
+                        detail="ELEVENLABS_API_KEY not configured for noise/reverb removal",
+                    )
+                with open(current_path, "rb") as f:
+                    audio_bytes = f.read()
+                try:
+                    cleaned = await voice_service.audio_isolate(
+                        audio_bytes, content_type="audio/mpeg"
+                    )
+                except voice_service.VoiceError as exc:
+                    raise HTTPException(
+                        status_code=502, detail=f"{op_type}: {exc}"
+                    )
+                with open(next_path, "wb") as f:
+                    f.write(cleaned)
+                labels.append(
+                    "Removed background noise"
+                    if op_type == "NOISE_REMOVAL"
+                    else "Removed reverb"
+                )
+                executed_types.append(op_type)
+                current_path = next_path
+                continue
+
+            # Transcript op: REMOVE_FILLERS
+            if op_type in audio_editor.TRANSCRIPT_OPERATIONS:
+                if op_type == "REMOVE_FILLERS":
+                    if not current_transcript:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Need a transcript before removing fillers — wait for transcription",
+                        )
+                    filler_refs = fillers_service.find_fillers(current_transcript)
+                    if not filler_refs:
+                        # Nothing to do — copy through.
+                        shutil.copyfile(current_path, next_path)
+                        labels.append("No filler words found")
+                        executed_types.append(op_type)
+                        current_path = next_path
+                        continue
+
+                    delete_ranges: List[Tuple[float, float]] = []
+                    ref_tuples: List[Tuple[int, int]] = []
+                    for ref in filler_refs:
+                        # find_fillers returns (segment_idx, word_idx) tuples
+                        si, wi = ref if isinstance(ref, tuple) else (
+                            ref.get("segment_idx"), ref.get("word_idx")
+                        )
+                        r = _word_range(current_transcript, si, wi)
+                        if r:
+                            delete_ranges.append(r)
+                            ref_tuples.append((si, wi))
+                    duration = await audio_editor.probe_duration(current_path)
+                    if duration <= 0:
+                        raise HTTPException(status_code=500, detail="Could not probe audio duration")
+                    keeps = audio_editor.keep_ranges(delete_ranges, duration)
+                    if not keeps:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Filler removal would erase the entire audio",
+                        )
+                    try:
+                        await audio_editor.render_with_keeps(current_path, keeps, next_path)
+                    except RuntimeError as exc:
+                        raise HTTPException(status_code=500, detail=str(exc))
+                    current_transcript = _apply_edits_to_transcript(
+                        current_transcript, ref_tuples, []
+                    )
+                    n = len(ref_tuples)
+                    labels.append(f"Removed {n} filler word{'' if n == 1 else 's'}")
+                    executed_types.append(op_type)
+                    current_path = next_path
+                    continue
+
+            # FFmpeg op: single filter-chain pass
+            if op_type in audio_editor.FFMPEG_OPERATIONS:
+                try:
+                    audio_filter, label = audio_editor.build_operation_filter(
+                        op_type, params
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
+                try:
+                    await audio_editor.apply_audio_filter(
+                        current_path, next_path, audio_filter
+                    )
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=500, detail=str(exc))
+                labels.append(label)
+                executed_types.append(op_type)
+                current_path = next_path
+                continue
+
+            # Anything else is a parser bug — bail loudly.
+            raise HTTPException(
+                status_code=500, detail=f"Pipeline can't execute op {op_type}"
+            )
+
+        # Read final output before the temp dir disappears.
+        with open(current_path, "rb") as f:
+            final_bytes = f.read()
+        new_duration = await audio_editor.probe_duration(current_path)
+
+    if not executed_types:
+        raise HTTPException(status_code=400, detail="No ops executed")
+
+    try:
+        public_url = await storage_upload(
+            user_id=_user_id(user),
+            filename=f"chat_pipeline_{project.id}.mp3",
+            data=final_bytes,
+            content_type="audio/mpeg",
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Upload processed audio: {exc}")
+
+    new_transcript = copy.deepcopy(current_transcript) if current_transcript else None
+    if new_transcript is not None:
+        new_transcript["duration"] = new_duration
+
+    label = " · ".join(labels)
+    if len(label) > 110:
+        label = label[:107] + "..."
+
+    version = AudioVersion(
+        project_id=project.id,
+        parent_id=project.active_version_id,
+        label=label,
+        audio_url=public_url,
+        transcript=new_transcript,
+        duration=new_duration,
+    )
+    db.add(version)
+    await db.flush()
+
+    project.audio_url = public_url
+    project.transcript = new_transcript
+    project.active_version_id = version.id
+    if new_transcript is not None:
+        flag_modified(project, "transcript")
+    await db.commit()
+    await db.refresh(version)
+    return version, executed_types
 
 
 @router.get("/{project_id}/processing", response_model=ProcessingStatus)
@@ -1229,10 +1513,13 @@ async def apply_operation(
         raise HTTPException(status_code=503, detail="Storage not configured")
 
     op_type = (payload.type or "").upper()
-    if op_type not in audio_editor.SUPPORTED_OPERATIONS:
+    # This endpoint only runs single-pass FFmpeg ops. API ops, transcript
+    # ops, and meta pipelines go through /chat which has the multi-op
+    # executor.
+    if op_type not in audio_editor.FFMPEG_OPERATIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported operation '{payload.type}'. Supported: {sorted(audio_editor.SUPPORTED_OPERATIONS)}",
+            detail=f"Unsupported operation '{payload.type}'. Supported: {sorted(audio_editor.FFMPEG_OPERATIONS)}",
         )
     try:
         audio_filter, default_label = audio_editor.build_operation_filter(

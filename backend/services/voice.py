@@ -198,6 +198,32 @@ async def synthesize(
     return resp.content
 
 
+async def audio_isolate(audio_bytes: bytes, content_type: str = "audio/mpeg") -> bytes:
+    """Strip background noise and reverb via ElevenLabs Voice Isolator.
+
+    POST /v1/audio-isolation accepts the source audio as multipart and
+    returns cleaned audio (mp3) as the response body. Works for both
+    NOISE_REMOVAL and REMOVE_REVERB — the isolator removes everything
+    that isn't the primary voice.
+    """
+    if not is_configured():
+        raise VoiceError("ELEVENLABS_API_KEY not configured")
+
+    files = {"audio": ("input.mp3", audio_bytes, content_type)}
+
+    async def _send(client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{ELEVENLABS_BASE}/audio-isolation",
+            headers=_headers(),
+            files=files,
+        )
+
+    resp = await _request_with_retry(_send, timeout=180.0)
+    if resp.status_code >= 400:
+        raise _parse_error(resp)
+    return resp.content
+
+
 async def delete_voice(voice_id: str) -> None:
     """Best-effort cleanup. We don't currently call this — kept for the
     settings page later. Failures are silent because ElevenLabs sometimes
