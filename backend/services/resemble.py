@@ -83,7 +83,7 @@ async def clone_voice(audio_bytes: bytes, name: str, content_type: str = "audio/
         create_resp = await client.post(
             f"{RESEMBLE_REST_BASE}/voices",
             headers=_headers({"Content-Type": "application/json"}),
-            json={"name": (name[:100] or "Sonicly voice"), "dataset_url": None},
+            json={"name": (name[:100] or "EigenTalk voice"), "dataset_url": None},
         )
         if create_resp.status_code >= 400:
             raise _parse_error(create_resp)

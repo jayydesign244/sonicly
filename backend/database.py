@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-DEV_SQLITE_URL = "sqlite+aiosqlite:///./sonicly_dev.db"
+DEV_SQLITE_URL = "sqlite+aiosqlite:///./eigentalk_dev.db"
 
 
 def _normalize_url(url: str) -> str:

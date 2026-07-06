@@ -1,4 +1,4 @@
-# Sonicly — AI Audio Editor
+# EigenTalk — AI Audio Editor
 
 A clean, minimal AI-powered audio editing web app. Built with React (frontend) and FastAPI (backend).
 

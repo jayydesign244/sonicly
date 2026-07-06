@@ -72,7 +72,7 @@ export default function SignUp() {
                   <rect x="17" y="8" width="2.5" height="4" rx="1.25" />
                 </svg>
               </div>
-              <span className="font-semibold text-gray-900">Sonicly</span>
+              <span className="font-semibold text-gray-900">EigenTalk</span>
             </button>
           </div>
 

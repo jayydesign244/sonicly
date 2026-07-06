@@ -136,8 +136,8 @@ async def clone_voice(audio_bytes: bytes, name: str, content_type: str = "audio/
         raise VoiceError("ELEVENLABS_API_KEY not configured")
 
     data = {
-        "name": name[:100] or "Sonicly voice",
-        "description": "Cloned by Sonicly for transcript-based edits",
+        "name": name[:100] or "EigenTalk voice",
+        "description": "Cloned by EigenTalk for transcript-based edits",
     }
 
     async def _send(client: httpx.AsyncClient) -> httpx.Response:

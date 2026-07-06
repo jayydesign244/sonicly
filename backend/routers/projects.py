@@ -56,7 +56,7 @@ def _get_openai_client() -> AsyncOpenAI:
     return _openai_client
 
 SYSTEM_PROMPT = (
-    "You are Sonicly, an AI audio editor running inside a real web app. "
+    "You are EigenTalk, an AI audio editor running inside a real web app. "
     "You CAN edit audio — not just give advice. A separate intent parser "
     "handles structured edit commands and executes them before you ever "
     "see the message. The user sees the result reflected in the editor."
@@ -1244,7 +1244,7 @@ async def _ensure_voice_clone(project: Project, source_audio: bytes) -> Tuple[st
         return project.voice_id, project.voice_provider == voice_service.FALLBACK_VOICE_PROVIDER
     try:
         voice_id = await voice_service.clone_voice(
-            source_audio, name=f"sonicly-{project.id}-{project.name[:32]}"
+            source_audio, name=f"eigentalk-{project.id}-{project.name[:32]}"
         )
         project.voice_id = voice_id
         project.voice_provider = "elevenlabs"

@@ -100,7 +100,7 @@ export default function Landing() {
         </h1>
 
         <p className="text-lg text-gray-500 max-w-md mb-10 animate-slide-up" style={{ animationDelay: '0.1s' }}>
-          Describe the changes in plain English. Sonicly handles the rest — noise removal, filler words, voice warmth, and more.
+          Describe the changes in plain English. EigenTalk handles the rest — noise removal, filler words, voice warmth, and more.
         </p>
 
         <div className="flex items-center gap-3 animate-slide-up" style={{ animationDelay: '0.15s' }}>
@@ -210,7 +210,7 @@ export default function Landing() {
       {/* Footer */}
       <footer className="border-t border-gray-100 py-6 px-6">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
-          <span className="text-xs text-gray-400">© 2026 Sonicly</span>
+          <span className="text-xs text-gray-400">© 2026 EigenTalk</span>
           <div className="flex items-center gap-5">
             <a href="#" className="text-xs text-gray-400 hover:text-gray-600 transition-colors">Privacy</a>
             <a href="#" className="text-xs text-gray-400 hover:text-gray-600 transition-colors">Terms</a>
@@ -350,7 +350,7 @@ function Logo() {
           <rect x="17" y="8" width="2.5" height="4" rx="1.25" />
         </svg>
       </div>
-      <span className="font-semibold text-gray-900 text-sm tracking-tight">Sonicly</span>
+      <span className="font-semibold text-gray-900 text-sm tracking-tight">EigenTalk</span>
     </div>
   )
 }

@@ -10,7 +10,7 @@ Estimated time: **30–45 minutes**.
 ### 1.1 Create the project
 1. Go to **https://supabase.com** → sign in with GitHub
 2. Click **New project**
-3. Pick a name (e.g. `sonicly`), set a strong DB password (save it), choose the region closest to your users
+3. Pick a name (e.g. `eigentalk`), set a strong DB password (save it), choose the region closest to your users
 4. Wait ~2 minutes while the project provisions
 
 ### 1.2 Grab your API keys
@@ -72,14 +72,14 @@ Visit http://localhost:3000/signup → click "Continue with Google" → should r
 cd "/Users/jaymakwana/AI Audio Editor"
 git init
 git add .
-git commit -m "Initial Sonicly setup"
-gh repo create sonicly --private --source . --push
+git commit -m "Initial EigenTalk setup"
+gh repo create eigentalk --private --source . --push
 # Or create the repo on github.com manually and push
 ```
 
 ### 2.2 Deploy
 1. Go to **https://vercel.com** → sign in with GitHub
-2. **Add New → Project** → import the `sonicly` repo
+2. **Add New → Project** → import the `eigentalk` repo
 3. **Root directory:** click "Edit" → select `frontend`
 4. Framework preset: **Vite** (auto-detected)
 5. **Environment Variables** → add:
@@ -88,12 +88,12 @@ gh repo create sonicly --private --source . --push
    - `VITE_API_URL` = (leave blank for now — fill after Railway is set up)
 6. Click **Deploy**
 
-Vercel gives you a URL like `https://sonicly-xyz.vercel.app`. Save it.
+Vercel gives you a URL like `https://eigentalk-xyz.vercel.app`. Save it.
 
 ### 2.3 Add the Vercel URL to Supabase
-**Authentication → URL Configuration** → add `https://sonicly-xyz.vercel.app` to:
+**Authentication → URL Configuration** → add `https://eigentalk-xyz.vercel.app` to:
 - **Site URL**
-- **Redirect URLs** (add `https://sonicly-xyz.vercel.app/**`)
+- **Redirect URLs** (add `https://eigentalk-xyz.vercel.app/**`)
 
 Otherwise OAuth redirects will fail in production.
 
@@ -103,24 +103,24 @@ Otherwise OAuth redirects will fail in production.
 
 ### 3.1 Deploy
 1. Go to **https://railway.app** → sign in with GitHub
-2. **New Project → Deploy from GitHub repo** → pick `sonicly`
+2. **New Project → Deploy from GitHub repo** → pick `eigentalk`
 3. Railway will detect both `frontend` and `backend` — click **Settings** on the service and set:
    - **Root Directory:** `backend`
    - **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT` (already in `railway.json`)
 4. **Variables** tab → add:
    - `SUPABASE_JWT_SECRET` = your JWT secret
-   - `ALLOWED_ORIGINS` = `https://sonicly-xyz.vercel.app,http://localhost:3000`
-5. **Settings → Networking → Generate Domain** to get a public URL (e.g. `sonicly-api.up.railway.app`)
+   - `ALLOWED_ORIGINS` = `https://eigentalk-xyz.vercel.app,http://localhost:3000`
+5. **Settings → Networking → Generate Domain** to get a public URL (e.g. `eigentalk-api.up.railway.app`)
 
 ### 3.2 Wire the frontend to the backend
 Back in **Vercel → Settings → Environment Variables**:
-- `VITE_API_URL` = `https://sonicly-api.up.railway.app/api`
+- `VITE_API_URL` = `https://eigentalk-api.up.railway.app/api`
 - Click **Redeploy** so the change takes effect
 
 ### 3.3 Verify
 ```bash
-curl https://sonicly-api.up.railway.app/api/health
-# → {"status":"ok","service":"sonicly-api"}
+curl https://eigentalk-api.up.railway.app/api/health
+# → {"status":"ok","service":"eigentalk-api"}
 ```
 
 ---
@@ -129,8 +129,8 @@ curl https://sonicly-api.up.railway.app/api/health
 
 | Layer | Lives at |
 |---|---|
-| Frontend | `https://sonicly-xyz.vercel.app` |
-| Backend | `https://sonicly-api.up.railway.app` |
+| Frontend | `https://eigentalk-xyz.vercel.app` |
+| Backend | `https://eigentalk-api.up.railway.app` |
 | Auth + DB | `https://YOUR_PROJECT_REF.supabase.co` |
 
 **What works now:**

@@ -120,7 +120,7 @@ function ClerkAuthBridge({ children }) {
 }
 
 const DEV_USER = { id: 'dev', email: 'dev@local', user_metadata: { name: 'Dev User' } }
-const DEV_AUTH_KEY = 'sonicly_dev_signed_in'
+const DEV_AUTH_KEY = 'eigentalk_dev_signed_in'
 
 function DevAuthProvider({ children }) {
   const [isAuthenticated, setIsAuthenticated] = useState(() => {

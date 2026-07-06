@@ -46,7 +46,7 @@ async def lifespan(app):
     yield
 
 app = FastAPI(
-    title="Sonicly API",
+    title="EigenTalk API",
     description="AI Audio Editor — Backend API",
     version="0.1.0",
     lifespan=lifespan,
@@ -81,7 +81,7 @@ if not supabase_configured():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "service": "sonicly-api"}
+    return {"status": "ok", "service": "eigentalk-api"}
 
 
 @app.get("/api/me")
